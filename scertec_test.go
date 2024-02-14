@@ -107,7 +107,7 @@ func TestDev(t *testing.T) {
 		t.Fatalf("unexpected RSA already parsed before requested")
 	}
 	c.forceRSA.Store(true)
-	res, err := hc.Head("https://" + *testDomain)
+	res, err := hc.Get("https://" + *testDomain)
 	if err != nil {
 		t.Fatalf("with RSA: %v", err)
 	}
