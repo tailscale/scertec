@@ -116,3 +116,35 @@ func TestDev(t *testing.T) {
 		t.Fatalf("no parsedCert for %q", secName)
 	}
 }
+
+func TestSupportsECDSA(t *testing.T) {
+	tests := []struct {
+		name string
+		h    *tls.ClientHelloInfo
+		want bool
+	}{
+		{
+			name: "ecdsa",
+			h: &tls.ClientHelloInfo{
+				ServerName:      "foo.com",
+				SupportedCurves: []tls.CurveID{tls.CurveP256},
+				CipherSuites:    []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+			},
+			want: true,
+		},
+		{
+			name: "rsa",
+			h:    &tls.ClientHelloInfo{ServerName: "foo.com"},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, err := supportsECDSA(tt.h); err != nil {
+				t.Fatal(err)
+			} else if got != tt.want {
+				t.Errorf("supportsECDSA() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

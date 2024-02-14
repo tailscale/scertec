@@ -14,10 +14,12 @@ import (
 	"crypto/tls"
 	"encoding/pem"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/tailscale/setec/client/setec"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 // Client looks up TLS certs stored in setec by scertecd as a function of a tls.ClientHelloInfo.
@@ -89,7 +91,11 @@ func NewClient(ctx context.Context, c setec.Client, cache setec.Cache, prefix st
 // It is the signature needed by tls.Config.GetCertificate.
 func (c *Client) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	typ := "rsa"
-	if supportsECDSA(hello) && !c.forceRSA.Load() {
+	canEC, err := supportsECDSA(hello)
+	if err != nil {
+		return nil, err
+	}
+	if canEC && !c.forceRSA.Load() {
 		typ = "ecdsa"
 	}
 	secName := secretName(c.prefix, hello.ServerName, typ)
@@ -132,51 +138,60 @@ func (c *Client) parsedCert(secName string, pems []byte) (*tls.Certificate, erro
 	return &cert, nil
 }
 
+// sniffKeyAutoCertCache is an x/crypto/acme/autocert.Cache implementation
+// as used by the common on supportsECDSA.
+type sniffKeyAutoCertCache chan<- string
+
+// errStopAutoCert is a sentinel error message we pass through acme/autocert
+// and expect to get back out to ourselves. It doesn't escape to scertec callers.
+var errStopAutoCert = errors.New("stop autocert")
+
+func (ch sniffKeyAutoCertCache) Get(ctx context.Context, key string) ([]byte, error) {
+	select {
+	case ch <- key:
+	default:
+	}
+	return nil, errStopAutoCert
+}
+
+func (ch sniffKeyAutoCertCache) Put(ctx context.Context, key string, data []byte) error {
+	panic("unreachable")
+}
+func (ch sniffKeyAutoCertCache) Delete(ctx context.Context, key string) error {
+	panic("unreachable")
+}
+
+var autoCertManagerPool = &sync.Pool{
+	New: func() any { return &autocert.Manager{Prompt: autocert.AcceptTOS} },
+}
+
 // supportsECDSA reports whether the given ClientHelloInfo supports ECDSA.
 //
-// This is copied from x/crypto/acme/autocert.
-func supportsECDSA(hello *tls.ClientHelloInfo) bool {
-	// The "signature_algorithms" extension, if present, limits the key exchange
-	// algorithms allowed by the cipher suites. See RFC 5246, section 7.4.1.4.1.
-	if hello.SignatureSchemes != nil {
-		ecdsaOK := false
-	schemeLoop:
-		for _, scheme := range hello.SignatureSchemes {
-			const tlsECDSAWithSHA1 tls.SignatureScheme = 0x0203 // constant added in Go 1.10
-			switch scheme {
-			case tlsECDSAWithSHA1, tls.ECDSAWithP256AndSHA256,
-				tls.ECDSAWithP384AndSHA384, tls.ECDSAWithP521AndSHA512:
-				ecdsaOK = true
-				break schemeLoop
-			}
-		}
-		if !ecdsaOK {
-			return false
-		}
+// Rather than copying acme/autocert's private implementation of this, we use
+// acme/autocert's own implementation indirectly by giving it a fake
+// autocert.Cache implementation and seeing which cache key autocert tries to
+// grab. It assumes that autocert fetches cache keys ending in "+rsa" for RSA
+// keys which in practice won't change (thanks, Hyrum!), but we also lock it
+// down in tests so we'll catch it if that behavior changes. Meanwhile,
+// discussions are underway in https://github.com/golang/go/issues/65727
+// of exporting that logic from acme/autocert somewhere.
+func supportsECDSA(hello *tls.ClientHelloInfo) (canEC bool, err error) {
+	am := autoCertManagerPool.Get().(*autocert.Manager)
+	defer autoCertManagerPool.Put(am)
+
+	ch := make(chan string, 1)
+	am.Cache = sniffKeyAutoCertCache(ch)
+	_, err = am.GetCertificate(hello)
+	if err == nil {
+		return false, errors.New("unexpected success from autocert GetCertificate")
+	} else if err != nil && !errors.Is(err, errStopAutoCert) {
+		return false, err
 	}
-	if hello.SupportedCurves != nil {
-		ecdsaOK := false
-		for _, curve := range hello.SupportedCurves {
-			if curve == tls.CurveP256 {
-				ecdsaOK = true
-				break
-			}
-		}
-		if !ecdsaOK {
-			return false
-		}
+	var got string
+	select {
+	case got = <-ch:
+	default:
+		panic("unexpected lack of response from sniffKeyAutoCertCache.Get")
 	}
-	for _, suite := range hello.CipherSuites {
-		switch suite {
-		case tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305:
-			return true
-		}
-	}
-	return false
+	return !strings.HasSuffix(got, "+rsa"), nil
 }
