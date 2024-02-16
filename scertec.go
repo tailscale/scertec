@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/tailscale/setec/client/setec"
 	"golang.org/x/crypto/acme/autocert"
@@ -30,7 +31,8 @@ type Client struct {
 	sc       setec.Client
 	st       *setec.Store
 	prefix   string
-	forceRSA atomic.Bool // for testing
+	allowed  map[string]bool // domain name => true
+	forceRSA atomic.Bool     // for testing
 
 	parsed sync.Map // secret name [string] => *parsedCert
 }
@@ -64,25 +66,23 @@ func NewClient(ctx context.Context, c setec.Client, cache setec.Cache, prefix st
 	if len(domains) == 0 {
 		return nil, errors.New("no domains provided")
 	}
-	var secretNames []string
+	allowed := make(map[string]bool, len(domains))
 	for _, d := range domains {
-		secretNames = append(secretNames,
-			secretName(prefix, d, "rsa"),
-			secretName(prefix, d, "ecdsa"),
-		)
+		allowed[d] = true
 	}
 	st, err := setec.NewStore(ctx, setec.StoreConfig{
-		Client:  c,
-		Secrets: secretNames,
-		Cache:   cache,
+		Client:      c,
+		Cache:       cache,
+		AllowLookup: true,
 	})
 	if err != nil {
 		return nil, err
 	}
 	return &Client{
-		sc:     c,
-		st:     st,
-		prefix: prefix,
+		sc:      c,
+		st:      st,
+		prefix:  prefix,
+		allowed: allowed,
 	}, nil
 }
 
@@ -90,6 +90,12 @@ func NewClient(ctx context.Context, c setec.Client, cache setec.Cache, prefix st
 //
 // It is the signature needed by tls.Config.GetCertificate.
 func (c *Client) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	if hello == nil {
+		return nil, errors.New("nil ClientHelloInfo")
+	}
+	if !c.allowed[hello.ServerName] {
+		return nil, errors.New("TLS ServerName not allowed")
+	}
 	typ := "rsa"
 	canEC, err := supportsECDSA(hello)
 	if err != nil {
@@ -99,10 +105,20 @@ func (c *Client) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, e
 		typ = "ecdsa"
 	}
 	secName := secretName(c.prefix, hello.ServerName, typ)
+
 	sec := c.st.Secret(secName)
+
+	// In the common case the above succeeds, once setec has seen it the first
+	// time. But if it's not there, we'll look it up with a timeout.
 	if sec == nil {
-		return nil, errors.New("invalid server name")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		sec, err = c.st.LookupSecret(ctx, secName)
+		if err != nil {
+			return nil, err
+		}
 	}
+
 	return c.parsedCert(secName, sec.Get())
 }
 
