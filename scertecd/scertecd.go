@@ -42,6 +42,7 @@ import (
 	"github.com/tailscale/setec/client/setec"
 	"github.com/tailscale/setec/types/api"
 	"golang.org/x/crypto/acme"
+	"golang.org/x/crypto/ocsp"
 )
 
 // Server is the scertec updater server.
@@ -93,7 +94,7 @@ func (s *Server) UpdateAll() error {
 	s.lazyInit()
 	for _, dt := range s.dts {
 		cu := s.newCertUpdateCheck(dt)
-		st, err := cu.updateIfNeeded(context.Background())
+		st, err := cu.updateIfNeeded(context.Background(), nil)
 		if err != nil {
 			cu.lg.Printf("updateIfNeeded error: %v", err)
 			return err
@@ -221,10 +222,16 @@ func (s *Server) renewCertLoop(dt domainAndType) {
 		if s.last == nil {
 			s.last = make(map[domainAndType]*certUpdateCheck)
 		}
+		prev := s.last[dt]
 		s.last[dt] = cu
 		s.mu.Unlock()
 
-		st, err := cu.updateIfNeeded(context.Background())
+		var prevRes *certUpdateResult
+		if prev != nil {
+			prevRes = prev.res
+		}
+
+		st, err := cu.updateIfNeeded(context.Background(), prevRes)
 		if err != nil {
 			cu.lg.Printf("updateIfNeeded error: %v", err)
 			time.Sleep(5 * time.Minute)
@@ -420,11 +427,15 @@ type certUpdateResult struct {
 	ExpiresAt     time.Time // time cert expires
 	SecretName    string
 	SecretVersion api.SecretVersion
+	LastOCSPCheck time.Time
 }
 
-// updateIfNeeded checks if the cert for cu.dt needs updating and fetches a new one
-// from LetsEncrypt using ACME if so.
-func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context) (res *certUpdateResult, retErr error) {
+// updateIfNeeded checks if the cert for cu.dt needs updating and fetches a new
+// one from LetsEncrypt using ACME if so.
+//
+// prev is the previous cert update check, if any. It will be nil on the first
+// check.
+func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateResult) (res *certUpdateResult, retErr error) {
 	defer func() {
 		cu.mu.Lock()
 		defer cu.mu.Unlock()
@@ -451,6 +462,21 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context) (res *certUpdateR
 			// It still has enough time left. The common case.
 			res.SecretVersion = sec.Version
 			res.ExpiresAt = m.ValidEnd
+
+			now := cu.s.Now()
+			if prev == nil || now.Sub(prev.LastOCSPCheck) > 10*time.Minute {
+				if ores, err := getOCSPResponse(ctx, m.Leaf, m.Issuer); err != nil {
+					cu.Logf("error fetching OCSP result, ignoring maybe-transient network issue: %v", err)
+				} else if ores.Status != ocsp.Good {
+					cu.Logf("OCSP status: %v", ores.Status)
+					return nil, fmt.Errorf("OCSP not good; got status=%v, reason=%v, at=%v", ores.Status, ores.RevocationReason, ores.RevokedAt)
+				} else {
+					cu.Logf("OCSP good")
+					res.LastOCSPCheck = now
+				}
+			} else {
+				res.LastOCSPCheck = prev.LastOCSPCheck
+			}
 			return res, nil
 		case err == errNeedNewCert:
 			cu.Logf("insufficient remaining time; fetching a new one")
@@ -617,6 +643,9 @@ func (cu *certUpdateCheck) getACMEChallenge(ctx context.Context) (*acmeChallenge
 type certMeta struct {
 	ValidStart time.Time // NotBefore of the latest cert (the domain cert)
 	ValidEnd   time.Time // NotAfter of the soonest expiring cert (the domain cert)
+
+	Leaf   *x509.Certificate // the domain cert
+	Issuer *x509.Certificate // the Let's Encrypt cert
 }
 
 // parseCertMeta parses the PEM of a previously-stored key+cert(s) in setec
@@ -643,13 +672,19 @@ func (s *Server) parseCertMeta(p []byte) (*certMeta, error) {
 	if !strings.HasSuffix(blocks[0].Type, " PRIVATE KEY") {
 		return nil, errors.New("first PEM block is not a private key")
 	}
-	for _, cb := range blocks[1:] {
+	certBlocks := blocks[1:]
+	for i, cb := range certBlocks {
 		if cb.Type != "CERTIFICATE" {
 			return nil, fmt.Errorf("unexpected PEM block of type %q", cb.Type)
 		}
 		c, err := x509.ParseCertificate(cb.Bytes)
 		if err != nil {
 			return nil, fmt.Errorf("parsing cert: %w", err)
+		}
+		if i == 0 {
+			m.Leaf = c
+		} else {
+			m.Issuer = c
 		}
 		if c.NotAfter.IsZero() {
 			return nil, errors.New("cert has no NotAfter")
@@ -868,4 +903,44 @@ func formatDuration(d time.Duration) string {
 		s = d.String()
 	}
 	return strings.TrimSuffix(s, "0s")
+}
+
+func getOCSPResponse(ctx context.Context, leaf, issuer *x509.Certificate) (*ocsp.Response, error) {
+	if leaf == nil {
+		return nil, errors.New("nil leaf")
+	}
+	if issuer == nil {
+		return nil, errors.New("nil issuer")
+	}
+	if len(leaf.OCSPServer) == 0 {
+		return nil, errors.New("no OCSP server")
+	}
+
+	reqb, err := ocsp.CreateRequest(leaf, issuer, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ocsp.CreateRequest: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	hreq, err := http.NewRequestWithContext(ctx, "POST", leaf.OCSPServer[0], bytes.NewReader(reqb))
+	if err != nil {
+		return nil, err
+	}
+	hreq.Header.Add("Content-Type", "application/ocsp-request")
+	hreq.Header.Add("Accept", "application/ocsp-response")
+	hres, err := http.DefaultClient.Do(hreq)
+	if err != nil {
+		return nil, err
+	}
+	defer hres.Body.Close()
+	if hres.StatusCode != 200 {
+		return nil, fmt.Errorf("unexpected HTTP status %v", hres.Status)
+	}
+	ocspRawRes, err := io.ReadAll(io.LimitReader(hres.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	return ocsp.ParseResponse(ocspRawRes, issuer)
 }
