@@ -21,10 +21,12 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"expvar"
 	"fmt"
 	"html/template"
 	"io"
@@ -55,18 +57,30 @@ import (
 type Server struct {
 	SetecClient setec.Client                     // required client for setec
 	Domains     []string                         // domains to maintain certs for
-	Now         func() time.Time                 // if nil, time.Now is used
+	Now         func() time.Time                 // if nil, initialized to time.Now
 	ACMEContact string                           // optional email address for ACME registration
-	Prefix      string                           // setec secret prefix
-	Logf        func(format string, args ...any) // alternate log function; if nil, log.Printf is used
+	Prefix      string                           // setec secret prefix ("prod/scertec/")
+	Logf        func(format string, args ...any) // if nil, initialized to log.Printf
 
 	lazyInitOnce sync.Once // guards dts and optional fields above
 	dts          []domainAndType
 
-	mu       sync.Mutex
-	acLazy   *acme.Client // nil until needed via getACMEClient
-	last     map[domainAndType]*certUpdateCheck
-	secCache map[string]*api.SecretValue
+	metricOCSPGood         expvar.Int
+	metricOCSPErrNetwork   expvar.Int
+	metricOCSPRevoked      expvar.Int
+	metricACMEStarted      expvar.Int
+	metricACMEFinished     expvar.Int
+	metricACMEErrors       expvar.Int
+	metricCheckErrors      expvar.Int
+	metricSetecErrors      expvar.Int
+	metricSetecGet         expvar.Int
+	metricSetecGetNoChange expvar.Int
+
+	mu             sync.Mutex
+	acLazy         *acme.Client // nil until needed via getACMEClient
+	lastOrCurCheck map[domainAndType]*certUpdateCheck
+	lastRes        map[domainAndType]*certUpdateResult
+	secCache       map[string]*api.SecretValue // secret name => latest version
 }
 
 func (s *Server) lazyInit() {
@@ -82,6 +96,8 @@ func (s *Server) lazyInit() {
 		if s.Now == nil {
 			s.Now = time.Now
 		}
+		s.lastOrCurCheck = make(map[domainAndType]*certUpdateCheck)
+		s.lastRes = make(map[domainAndType]*certUpdateResult)
 	})
 }
 
@@ -109,6 +125,7 @@ func (s *Server) UpdateAll() error {
 // check and not used thereafter.
 func (s *Server) Start(ctx context.Context) error {
 	s.lazyInit()
+
 	if _, err := s.getACMEClient(ctx); err != nil {
 		return err
 	}
@@ -137,12 +154,15 @@ func (s *Server) getACMEClient(ctx context.Context) (*acme.Client, error) {
 }
 
 var tmpls = template.Must(template.New("root").Parse(`
-<html><h1>scertecd</h1><table border=1 cellpadding=5>
+<html><h1>scertecd</h1>
+[<a href="/metrics">metrics</a>]
+<table border=1 cellpadding=5>
 {{range .Certs}}
    <tr>
        <td><b>{{.Name}}</b>
 	   <td>{{.Status}}
 	       {{if .Log}}<pre>{{.Log}}</pre>{{end}}
+		   {{if .SHA256}}[<a href="https://search.censys.io/certificates/{{.SHA256}}">censys</a>]{{end}}
 	   </td>
    </tr>
 {{end}}
@@ -150,10 +170,23 @@ var tmpls = template.Must(template.New("root").Parse(`
 `))
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/":
+		s.serveRoot(w, r)
+	case "/metrics":
+		s.serveMetrics(w, r)
+	default:
+		http.Error(w, "not found", http.StatusNotFound)
+	}
+}
+
+func (s *Server) serveRoot(w http.ResponseWriter, r *http.Request) {
 	type certData struct {
-		Name   string
-		Status string
-		Log    string
+		Name    string
+		Status  string
+		Log     string
+		Version int
+		SHA256  string
 	}
 	var data struct {
 		Certs []certData
@@ -177,24 +210,73 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			cd.Status = "error: " + cu.err.Error()
 		} else if cu.res == nil {
 			cd.Status = "unexpected done with no error and no result"
+		} else if cu.res.CertMeta == nil {
+			cd.Status = "unexpected done with no error and no cert meta"
 		} else {
 			cd.Status = fmt.Sprintf("success; version %d; checked %v ago, good for %v",
 				cu.res.SecretVersion,
 				now.Sub(cu.end).Round(time.Second),
-				formatDuration(cu.res.ExpiresAt.Sub(now)))
+				formatDuration(cu.res.CertMeta.ValidEnd.Sub(now)))
+			cd.Version = int(cu.res.SecretVersion)
+			cd.SHA256 = fmt.Sprintf("%x", sha256.Sum256(cu.res.CertMeta.Leaf.Raw))
 		}
 		data.Certs = append(data.Certs, cd)
 	}
 
 	for _, dt := range s.dts {
 		s.mu.Lock()
-		last := s.last[dt]
+		last := s.lastOrCurCheck[dt]
 		s.mu.Unlock()
 		addRow(last)
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	tmpls.ExecuteTemplate(w, "root", data)
+}
+
+func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := s.Now()
+
+	good := 0
+	bad := 0
+
+	fmt.Fprintf(w, "scertecd_managed_certs %d\n", len(s.dts))
+	for _, dt := range s.dts {
+		res := s.lastRes[dt]
+		if res == nil || res.CertMeta == nil || res.CertMeta.ValidEnd.Before(now) {
+			bad++
+		} else {
+			renewalTime := res.CertMeta.RenewalTime()
+			secRemain := int64(res.CertMeta.ValidEnd.Sub(now).Seconds())
+			secUntilRenew := int64(renewalTime.Sub(now).Seconds())
+			fmt.Fprintf(w, "scertecd_cert_seconds_remain{domain=%q} %v\n", dt, secRemain)
+			fmt.Fprintf(w, "scertecd_cert_seconds_until_renewal{domain=%q} %v\n", dt, max(secUntilRenew, 0))
+			if now.After(renewalTime.Add(15*time.Minute)) || now.Sub(res.LastOCSPCheck) > 30*time.Minute {
+				bad++
+			} else {
+				good++
+			}
+		}
+	}
+	add := func(s string, v int64) {
+		fmt.Fprintf(w, "scertecd_%s %d\n", s, v)
+	}
+	add("certs_cur_good", int64(good))
+	add("certs_cur_bad", int64(bad))
+	add("ocsp_good", s.metricOCSPGood.Value())
+	add("ocsp_err_network", s.metricOCSPErrNetwork.Value())
+	add("ocsp_revoked", s.metricOCSPRevoked.Value())
+	add("acme_started", s.metricACMEStarted.Value())
+	add("acme_finished", s.metricACMEFinished.Value())
+	add("acme_errors", s.metricACMEErrors.Value())
+	add("check_errors", s.metricCheckErrors.Value())
+	add("setec_errors", s.metricSetecErrors.Value())
+	add("setec_get", s.metricSetecGet.Value())
+	add("setec_get_no_change", s.metricSetecGetNoChange.Value())
 }
 
 func (s *Server) now() time.Time {
@@ -219,11 +301,8 @@ func (s *Server) renewCertLoop(dt domainAndType) {
 		cu := s.newCertUpdateCheck(dt)
 
 		s.mu.Lock()
-		if s.last == nil {
-			s.last = make(map[domainAndType]*certUpdateCheck)
-		}
-		prev := s.last[dt]
-		s.last[dt] = cu
+		prev := s.lastOrCurCheck[dt]
+		s.lastOrCurCheck[dt] = cu
 		s.mu.Unlock()
 
 		var prevRes *certUpdateResult
@@ -231,12 +310,22 @@ func (s *Server) renewCertLoop(dt domainAndType) {
 			prevRes = prev.res
 		}
 
-		st, err := cu.updateIfNeeded(context.Background(), prevRes)
+		res, err := cu.updateIfNeeded(context.Background(), prevRes)
 		if err != nil {
 			cu.lg.Printf("updateIfNeeded error: %v", err)
+			// In case we violated some rate limit, sleep a bit. We should be
+			// looking at acme response headers/errors more but in the meantime,
+			// just conservatively sleep more than hopefully necessary.
 			time.Sleep(5 * time.Minute)
 		} else {
-			cu.lg.Printf("success; %+v", st)
+			s.mu.Lock()
+			s.lastRes[dt] = res
+			s.mu.Unlock()
+
+			// In the happy path, we just keep checking regularly. The checks
+			// are cheap: just an if-modified-since call to setec. The OCSP checks
+			// will be skipped if it was done recently enough (per prevRes).
+			cu.lg.Printf("success; %+v", res)
 			time.Sleep(1 * time.Minute)
 		}
 	}
@@ -390,18 +479,24 @@ func (s *Server) getSecret(ctx context.Context, secName string) (*api.SecretValu
 	if have != nil {
 		v, err = s.SetecClient.GetIfChanged(ctx, secName, have.Version)
 		if errors.Is(err, api.ErrValueNotChanged) {
+			s.metricSetecGetNoChange.Add(1)
 			return have, nil
 		}
 	} else {
 		v, err = s.SetecClient.Get(ctx, secName)
 	}
 	if v != nil {
+		s.metricSetecGet.Add(1)
+
 		s.mu.Lock()
 		if s.secCache == nil {
 			s.secCache = make(map[string]*api.SecretValue)
 		}
 		s.secCache[secName] = v
 		s.mu.Unlock()
+	}
+	if err != nil {
+		s.metricSetecErrors.Add(1)
 	}
 	return v, err
 }
@@ -424,7 +519,8 @@ func (s *Server) putAndActivateSecret(ctx context.Context, logf logf, secName st
 
 type certUpdateResult struct {
 	Updated       bool
-	ExpiresAt     time.Time // time cert expires
+	CheckedAt     time.Time
+	CertMeta      *certMeta
 	SecretName    string
 	SecretVersion api.SecretVersion
 	LastOCSPCheck time.Time
@@ -435,13 +531,15 @@ type certUpdateResult struct {
 //
 // prev is the previous cert update check, if any. It will be nil on the first
 // check.
-func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateResult) (res *certUpdateResult, retErr error) {
+func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateResult) (_ *certUpdateResult, retErr error) {
 	defer func() {
 		cu.mu.Lock()
 		defer cu.mu.Unlock()
 		cu.end = cu.s.now()
-		cu.res = res
 		cu.err = retErr
+		if retErr != nil {
+			cu.s.metricCheckErrors.Add(1)
+		}
 	}()
 
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute) // minute for Route 53 + minute for ACME exchanges
@@ -449,9 +547,11 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 
 	secName := cu.dt.SecretName(cu.s)
 
-	res = &certUpdateResult{
+	res := &certUpdateResult{
 		SecretName: secName,
+		CheckedAt:  cu.s.Now(),
 	}
+	cu.res = res
 
 	// See if we have an existing cert in setec that still has sufficient
 	// remaining expiry time.
@@ -461,17 +561,20 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 		case err == nil:
 			// It still has enough time left. The common case.
 			res.SecretVersion = sec.Version
-			res.ExpiresAt = m.ValidEnd
+			res.CertMeta = m
 
 			now := cu.s.Now()
 			if prev == nil || now.Sub(prev.LastOCSPCheck) > 10*time.Minute {
 				if ores, err := getOCSPResponse(ctx, m.Leaf, m.Issuer); err != nil {
 					cu.Logf("error fetching OCSP result, ignoring maybe-transient network issue: %v", err)
+					cu.s.metricOCSPErrNetwork.Add(1)
 				} else if ores.Status != ocsp.Good {
 					cu.Logf("OCSP status: %v", ores.Status)
+					cu.s.metricOCSPRevoked.Add(1)
 					return nil, fmt.Errorf("OCSP not good; got status=%v, reason=%v, at=%v", ores.Status, ores.RevocationReason, ores.RevokedAt)
 				} else {
 					cu.Logf("OCSP good")
+					cu.s.metricOCSPGood.Add(1)
 					res.LastOCSPCheck = now
 				}
 			} else {
@@ -489,6 +592,14 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 
 	// We need a new cert. Start the ACME dns-01 dance and
 	// get a challenge.
+	acmeRunning := true
+	defer func() {
+		if acmeRunning && retErr != nil {
+			cu.s.metricACMEErrors.Add(1)
+		}
+	}()
+	cu.s.metricACMEStarted.Add(1)
+
 	chal, err := cu.getACMEChallenge(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("getACMEChallenge: %w", err)
@@ -506,6 +617,9 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 	if err != nil {
 		return nil, fmt.Errorf("finishACME: %w", err)
 	}
+	cu.s.metricACMEFinished.Add(1)
+	acmeRunning = false
+
 	m, err := cu.s.parseCertMeta(allPEM)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse newly fetched cert: %w", err)
@@ -516,7 +630,7 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 		return nil, err
 	}
 	res.Updated = true
-	res.ExpiresAt = m.ValidEnd
+	res.CertMeta = m
 	return res, nil
 }
 
@@ -648,6 +762,11 @@ type certMeta struct {
 	Issuer *x509.Certificate // the Let's Encrypt cert
 }
 
+// RenewalTime returns the time two thirds of the way between ValidStart and ValidEnd.
+func (m *certMeta) RenewalTime() time.Time {
+	return m.ValidEnd.Add(-(m.ValidEnd.Sub(m.ValidStart) / 3))
+}
+
 // parseCertMeta parses the PEM of a previously-stored key+cert(s) in setec
 // and returns metadata about the validity window of the cert(s).
 // If we're over 2/3rds of the way through its validity period, it returns
@@ -700,14 +819,7 @@ func (s *Server) parseCertMeta(p []byte) (*certMeta, error) {
 		}
 	}
 
-	validDur := m.ValidEnd.Sub(m.ValidStart)
-	leeway := validDur / 3
-	const day = 24 * time.Hour
-	if leeway < day {
-		leeway = day
-	}
-	remain := m.ValidEnd.Sub(s.Now())
-	if remain < leeway {
+	if s.Now().After(m.RenewalTime()) {
 		return m, errNeedNewCert
 	}
 	return m, nil
