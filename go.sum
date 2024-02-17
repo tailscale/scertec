@@ -57,8 +57,8 @@ github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZN
 github.com/rogpeppe/go-internal v1.11.0 h1:cWPaGQEPrBb5/AsnsZesgZZ9yb1OQ+GOISoDNXVBh4M=
 github.com/rogpeppe/go-internal v1.11.0/go.mod h1:ddIwULY96R17DhadqLgMfk9H9tvdUzkipdSkR5nkCZA=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
-github.com/tailscale/setec v0.0.0-20240212223814-3648fd9bc775 h1:veH+HTclBeThrnMZyxx2wig5n9bWsp+pQjdsnfNZTL8=
-github.com/tailscale/setec v0.0.0-20240212223814-3648fd9bc775/go.mod h1:6aROaLnIr5yo1jhQ42z/vOjNcXaQRuCQZivWroLHqjo=
+github.com/tailscale/setec v0.0.0-20240217033517-a4d9ef5afc5b h1:aGVT9g02PmAV7I6idklzWeJVVV60FgDdGjbe6t2LMD0=
+github.com/tailscale/setec v0.0.0-20240217033517-a4d9ef5afc5b/go.mod h1:Mayqq+tl9DwM0g2aQ70B2SH6VFMRLZZJtLYcQllPbFA=
 github.com/tink-crypto/tink-go/v2 v2.1.0 h1:QXFBguwMwTIaU17EgZpEJWsUSc60b1BAGTzBIoMdmok=
 github.com/tink-crypto/tink-go/v2 v2.1.0/go.mod h1:y1TnYFt1i2eZVfx4OGc+C+EMp4CoKWAw2VSEuoicHHI=
 github.com/yuin/goldmark v1.4.13/go.mod h1:6yULJ656Px+3vBD8DxQVa3kxgyrAnzto9xy5taEt/CY=
@@ -110,5 +110,5 @@ gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8
 gopkg.in/yaml.v2 v2.2.8/go.mod h1:hI93XBmqTisBFMUTm0b8Fm+jr3Dg1NNxqwp+5A1VGuI=
 gopkg.in/yaml.v2 v2.4.0 h1:D8xgwECY7CYvx+Y2n4sBz93Jn9JRvxdiyyo8CTfuKaY=
 gopkg.in/yaml.v2 v2.4.0/go.mod h1:RDklbk79AGWmwhnvt/jBztapEOGDOx6ZbXqjP6csGnQ=
-tailscale.com v1.1.1-0.20240201195624-ba70cbb930aa h1:tyNNlHtRoShGo7kvYWLtQNcIQLu++jI9eOAgXoJ2Yt0=
-tailscale.com v1.1.1-0.20240201195624-ba70cbb930aa/go.mod h1:OzXvPtqQWqQUlyf50NL9+dwQss1NSIJtjBhfmovLQ6E=
+tailscale.com v1.1.1-0.20240212200800-c42a4e407a9f h1:jqeK/N5vs8blwG3okBTOSkjvGaadut4j7d3+O9/Yx9c=
+tailscale.com v1.1.1-0.20240212200800-c42a4e407a9f/go.mod h1:qgxvJUlfOWeURBEORdcX4EhoCduFHeBW3FNIZBpmIHY=

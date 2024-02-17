@@ -4,7 +4,7 @@ go 1.22.0
 
 require (
 	github.com/aws/aws-sdk-go v1.44.267
-	github.com/tailscale/setec v0.0.0-20240212223814-3648fd9bc775
+	github.com/tailscale/setec v0.0.0-20240217033517-a4d9ef5afc5b
 	golang.org/x/crypto v0.18.0
 )
 
@@ -16,5 +16,5 @@ require (
 	golang.org/x/sync v0.6.0 // indirect
 	golang.org/x/sys v0.16.0 // indirect
 	golang.org/x/text v0.14.0 // indirect
-	tailscale.com v1.1.1-0.20240201195624-ba70cbb930aa // indirect
+	tailscale.com v1.1.1-0.20240212200800-c42a4e407a9f // indirect
 )
