@@ -78,6 +78,7 @@ type Server struct {
 	lastOrCurCheck map[domainAndType]*certUpdateCheck
 	lastRes        map[domainAndType]*certUpdateResult
 	secCache       map[string]*api.SecretValue // secret name => latest version
+	domainLock     map[string]chan struct{}    // domain name => 1-buffered semaphore channel to limit concurrent renewals
 }
 
 func (s *Server) lazyInit() {
@@ -136,6 +137,50 @@ func (s *Server) Start(ctx context.Context) error {
 		go s.renewCertLoop(dt)
 	}
 	return nil
+}
+
+// acquireDomainRenewalLock acquires a lock for the given domain name,
+// preventing RSA and ECDSA renewals from happening concurrently for the same
+// domain and fighting over TXT records. See
+// https://github.com/tailscale/scertec/issues/4. This isn't a perfect solution,
+// but it's a simple one. We could make it possible for both to run at the same
+// time later if we change how DNS records are managed.
+
+func (s *Server) acquireDomainRenewalLock(ctx context.Context, logf logf, domain string) (release func(), err error) {
+	s.mu.Lock()
+	if s.domainLock == nil {
+		s.domainLock = make(map[string]chan struct{})
+	}
+	sem, ok := s.domainLock[domain]
+	if !ok {
+		sem = make(chan struct{}, 1)
+		s.domainLock[domain] = sem
+	}
+	s.mu.Unlock()
+
+	release = func() {
+		logf("release domain renewal lock for %q", domain)
+		<-sem
+	}
+
+	select {
+	case sem <- struct{}{}:
+		logf("immediately acquired domain renewal lock for %q", domain)
+		return release, nil
+	default:
+		logf("waiting for domain renewal lock for %q (currently held by other renewal)", domain)
+	}
+	t0 := s.Now()
+
+	select {
+	case sem <- struct{}{}:
+		logf("acquired domain renewal lock for %q after waiting %v", domain, s.Now().Sub(t0).Round(time.Millisecond))
+		return release, nil
+	case <-ctx.Done():
+		err := ctx.Err()
+		logf("timeout waiting for domain renewal lock for %q: %v", domain, err)
+		return nil, err
+	}
 }
 
 func (s *Server) getACMEClient(ctx context.Context) (*acme.Client, error) {
@@ -548,7 +593,7 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 		cu.err = retErr
 	}()
 
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute) // minute for Route 53 + minute for ACME exchanges
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute) // minute for Route 53 + plenty of slack for ACME exchanges + RSA/ECDSA being serialized
 	defer cancel()
 
 	secName := cu.dt.SecretName(cu.s)
@@ -596,8 +641,15 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 		return nil, fmt.Errorf("could not get %q secret: %w", secName, err)
 	}
 
-	// We need a new cert. Start the ACME dns-01 dance and
-	// get a challenge.
+	// We need a new cert. Start the ACME dns-01 dance and get a challenge. But
+	// only permit one renewal per DNS name at a time, so our TXT records don't
+	// fight (https://github.com/tailscale/scertec/issues/4).
+	release, err := cu.s.acquireDomainRenewalLock(ctx, cu.Logf, cu.dt.domain)
+	if err != nil {
+		return nil, fmt.Errorf("acquireDomainRenewalLock: %w", err)
+	}
+	defer release()
+
 	cu.s.metricCurRenewals.Add(1)
 	defer cu.s.metricCurRenewals.Add(-1)
 	cu.s.metricRenewalsStarted.Add(1)
