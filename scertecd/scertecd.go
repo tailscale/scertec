@@ -36,6 +36,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -64,6 +65,7 @@ type Server struct {
 
 	lazyInitOnce sync.Once // guards dts and optional fields above
 	dts          []domainAndType
+	startTime    time.Time // time the server was started, for metrics
 
 	metricOCSPGood         expvar.Int
 	metricOCSPRevoked      expvar.Int
@@ -72,6 +74,8 @@ type Server struct {
 	metricCurRenewals      expvar.Int // gauge of in-flight renewals
 	metricSetecGet         expvar.Int
 	metricSetecGetNoChange expvar.Int
+	metricMadeDNSRecords   expvar.Int
+	lastMadeDNSRecord      atomic.Int64 // unix time of last successful DNS record made
 
 	mu             sync.Mutex
 	acLazy         *acme.Client // nil until needed via getACMEClient
@@ -83,6 +87,7 @@ type Server struct {
 
 func (s *Server) lazyInit() {
 	s.lazyInitOnce.Do(func() {
+		s.startTime = time.Now()
 		for _, d := range s.Domains {
 			for _, typ := range []CertType{RSACert, ECDSACert} {
 				s.dts = append(s.dts, domainAndType{d, typ})
@@ -96,12 +101,12 @@ func (s *Server) lazyInit() {
 		}
 		s.lastOrCurCheck = make(map[domainAndType]*certUpdateCheck)
 		s.lastRes = make(map[domainAndType]*certUpdateResult)
-		s.metricErrorCount.Add("setec-get", 0)
-		s.metricErrorCount.Add("setec-put", 0)
-		s.metricErrorCount.Add("setec-activate", 0)
-		s.metricErrorCount.Add("acme-get-challenge", 0)
-		s.metricErrorCount.Add("aws-make-record", 0)
-		s.metricErrorCount.Add("acme-finish", 0)
+		s.addError0(errTypeSetecGet)
+		s.addError0(errTypeSetecPut)
+		s.addError0(errTypeSetecActivate)
+		s.addError0(errTypeACMEGetChallenge)
+		s.addError0(errTypeMakeRecord)
+		s.addError0(errTypeACMEFinish)
 	})
 }
 
@@ -133,6 +138,8 @@ func (s *Server) Start(ctx context.Context) error {
 	if _, err := s.getACMEClient(ctx); err != nil {
 		return err
 	}
+
+	go s.checkAWSPermissionsLoop()
 	for _, dt := range s.dts {
 		go s.renewCertLoop(dt)
 	}
@@ -282,17 +289,36 @@ func (s *Server) serveRoot(w http.ResponseWriter, r *http.Request) {
 	tmpls.ExecuteTemplate(w, "root", data)
 }
 
+// Consts for at least the broad error types, and anything referenced multiple
+// times, but not necessarily every little unlikely error path. String literals
+// in rare error cases are fine.
+const (
+	errTypeMakeRecord       = "aws-make-record"
+	errTypeSetecGet         = "setec-get"
+	errTypeSetecPut         = "setec-put"
+	errTypeSetecActivate    = "setec-activate"
+	errTypeACMEGetChallenge = "acme-get-challenge"
+	errTypeACMEFinish       = "acme-finish"
+	errTypeCheckCertSetec   = "check-cert-setec"
+)
+
 func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	now := s.Now()
+	uptime := now.Sub(s.startTime)
 
 	good := 0
 	bad := 0
 
-	fmt.Fprintf(w, "scertecd_managed_certs %d\n", len(s.dts))
+	fmt.Fprintf(w, "uptime %d\n", int64(uptime.Seconds()))
+	add := func(s string, v int64) {
+		fmt.Fprintf(w, "scertecd_%s %d\n", s, v)
+	}
+	add("managed_certs", int64(len(s.dts)))
+
 	for _, dt := range s.dts {
 		res := s.lastRes[dt]
 		if res == nil || res.CertMeta == nil || res.CertMeta.ValidEnd.Before(now) {
@@ -310,9 +336,6 @@ func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	add := func(s string, v int64) {
-		fmt.Fprintf(w, "scertecd_%s %d\n", s, v)
-	}
 	add("certs_cur_good", int64(good))
 	add("certs_cur_bad", int64(bad))
 	add("ocsp_checks_good", s.metricOCSPGood.Value())
@@ -321,6 +344,23 @@ func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	add("certs_cur_renewals", s.metricCurRenewals.Value())
 	add("setec_get", s.metricSetecGet.Value())
 	add("setec_get_no_change", s.metricSetecGetNoChange.Value())
+	add("made_dns_records", s.metricMadeDNSRecords.Value()) // including tests
+
+	var dnsErrors int64
+	if e, ok := s.metricErrorCount.Get(errTypeMakeRecord).(*expvar.Int); ok {
+		dnsErrors = e.Value()
+	}
+	if uptime < 5*time.Minute && dnsErrors == 0 && s.metricMadeDNSRecords.Value() == 0 {
+		// At startup, don't emit metrics related to DNS errors while the first
+		// test is ongoing,
+	} else {
+		lastTime := s.lastMadeDNSRecord.Load()
+		if lastTime == 0 {
+			add("alert_dns_permission_problem_likely", 1)
+		} else {
+			add("last_dns_record_seconds_ago", now.Unix()-lastTime)
+		}
+	}
 
 	s.metricErrorCount.Do(func(kv expvar.KeyValue) {
 		fmt.Fprintf(w, "scertecd_error{type=%q} %d\n", kv.Key, kv.Value.(*expvar.Int).Value())
@@ -517,6 +557,10 @@ func (s *Server) addError(errType string) {
 	s.metricErrorCount.Add(errType, 1)
 }
 
+func (s *Server) addError0(errType string) {
+	s.metricErrorCount.Add(errType, 0)
+}
+
 // getSecret fetches a secret from setec, remembering any fetched value so
 // most calls end up doing a GetIfChanged called to setec which results in
 // fewer audit log entries.
@@ -548,7 +592,7 @@ func (s *Server) getSecret(ctx context.Context, secName string) (*api.SecretValu
 		s.mu.Unlock()
 	}
 	if err != nil {
-		s.addError("setec-get")
+		s.addError(errTypeSetecGet)
 	}
 	return v, err
 }
@@ -558,13 +602,13 @@ type logf = func(format string, args ...any)
 func (s *Server) putAndActivateSecret(ctx context.Context, logf logf, secName string, secValue []byte) (api.SecretVersion, error) {
 	v, err := s.SetecClient.Put(ctx, secName, secValue)
 	if err != nil {
-		s.addError("setec-put")
+		s.addError(errTypeSetecPut)
 		return 0, fmt.Errorf("could not create %q secret: %w", secName, err)
 	}
 	logf("created secret %q version %v", secName, v)
 	err = s.SetecClient.Activate(ctx, secName, v)
 	if err != nil {
-		s.addError("setec-activate")
+		s.addError(errTypeSetecActivate)
 		return 0, fmt.Errorf("could not activate %q version %v: %w", secName, v, err)
 	}
 	logf("activated secret %q version %v", secName, v)
@@ -637,7 +681,7 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 			cu.Logf("failed to parse cached cert: %v", err)
 		}
 	} else if !errors.Is(err, api.ErrNotFound) {
-		cu.s.addError("check-setec-get")
+		cu.s.addError(errTypeCheckCertSetec)
 		return nil, fmt.Errorf("could not get %q secret: %w", secName, err)
 	}
 
@@ -656,14 +700,14 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 
 	chal, err := cu.getACMEChallenge(ctx)
 	if err != nil {
-		cu.s.addError("acme-get-challenge")
+		cu.s.addError(errTypeACMEGetChallenge)
 		return nil, fmt.Errorf("getACMEChallenge: %w", err)
 	}
 
 	// Make the DNS record we were told to make to prove we control the DNS.
 	err = cu.s.makeRecord(ctx, cu.Logf, chal.dnsRecordName, chal.dnsRecordValue)
 	if err != nil {
-		cu.s.addError("aws-make-record")
+		cu.s.addError(errTypeMakeRecord)
 		return nil, fmt.Errorf("makeRecord %q: %w", chal.dnsRecordName, err)
 	}
 	cu.Logf("made DNS record %q", chal.dnsRecordName)
@@ -671,7 +715,7 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 	// Finish the ACME dance.
 	allPEM, err := cu.finishACME(ctx, chal)
 	if err != nil {
-		cu.s.addError("acme-finish")
+		cu.s.addError(errTypeACMEFinish)
 		return nil, fmt.Errorf("finishACME: %w", err)
 	}
 
@@ -1055,7 +1099,13 @@ func (s *Server) makeRecord(ctx context.Context, logf logf, recordName, txtVal s
 	}
 	logf("ChangeInfo: %+v", ci)
 
-	return ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	s.lastMadeDNSRecord.Store(time.Now().Unix())
+	s.metricMadeDNSRecords.Add(1)
+	return nil
 }
 
 // formatDuration is like time.Duration.String but
@@ -1124,4 +1174,46 @@ func (s *Server) getOCSPResponse(ctx context.Context, leaf, issuer *x509.Certifi
 		return nil, err
 	}
 	return res, nil
+}
+
+// checkAWSPermissionsLoop is a background goroutine that periodically checks
+// whether our Route53 IAM permissions are still valid. This is meant to protect
+// us from moving the certd server between VMs and not having the right roles on
+// the new VM and then not noticing until certs fail to expire.
+//
+// On failure, this sets a metric on the server that we can then alert.
+func (s *Server) checkAWSPermissionsLoop() {
+	for {
+		if err := s.checkAWSPermissions(); err != nil {
+			s.Logf("checkAWSPermissions error: %v", err)
+			s.addError(errTypeMakeRecord)
+		}
+		time.Sleep(1 * time.Hour)
+	}
+}
+
+// checkAWSPermissions makes a test Route53 record to see if we have
+// suitable permissions.
+func (s *Server) checkAWSPermissions() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	var buf bytes.Buffer
+	lg := log.New(&buf, "", log.LstdFlags|log.Lmsgprefix)
+	logf := lg.Printf
+
+	domain := s.dts[0].domain // TODO(bradfitz): random? check each unique domain?
+	release, err := s.acquireDomainRenewalLock(ctx, logf, domain)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	t0 := time.Now()
+	if err := s.makeRecord(ctx, logf, "_acme-challenge."+domain, fmt.Sprintf("permtest-%v", time.Now().Unix())); err != nil {
+		s.Logf("checkAWSPermissions makeRecord error: %v, %s", err, buf.Bytes())
+		return err
+	}
+	s.Logf("checkAWSPermissions success; took %v", time.Since(t0).Round(time.Millisecond))
+	return nil
 }
