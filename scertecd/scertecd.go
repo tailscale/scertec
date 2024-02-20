@@ -26,7 +26,6 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
-	"expvar"
 	"fmt"
 	"html/template"
 	"io"
@@ -36,12 +35,14 @@ import (
 	"path"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/route53"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/tailscale/setec/client/setec"
 	"github.com/tailscale/setec/types/api"
 	"golang.org/x/crypto/acme"
@@ -67,15 +68,16 @@ type Server struct {
 	dts          []domainAndType
 	startTime    time.Time // time the server was started, for metrics
 
-	metricOCSPGood         expvar.Int
-	metricOCSPRevoked      expvar.Int
-	metricErrorCount       expvar.Map // error type => count
-	metricRenewalsStarted  expvar.Int // counter of renewal started
-	metricCurRenewals      expvar.Int // gauge of in-flight renewals
-	metricSetecGet         expvar.Int
-	metricSetecGetNoChange expvar.Int
-	metricMadeDNSRecords   expvar.Int
-	lastMadeDNSRecord      atomic.Int64 // unix time of last successful DNS record made
+	mOCSPChecks      *prometheus.CounterVec
+	mCurRenewals     prometheus.Gauge
+	mRenewalAttempts prometheus.Counter
+	mRenewalErrors   *prometheus.CounterVec
+	mSetecReqs       *prometheus.CounterVec
+	mExpirationTimes *prometheus.GaugeVec
+	mRenewalTimes    *prometheus.GaugeVec
+	mOCSPTimes       *prometheus.GaugeVec
+	mLastDNSChange   prometheus.Gauge
+	mDNSChanges      prometheus.Counter
 
 	mu             sync.Mutex
 	acLazy         *acme.Client // nil until needed via getACMEClient
@@ -101,12 +103,53 @@ func (s *Server) lazyInit() {
 		}
 		s.lastOrCurCheck = make(map[domainAndType]*certUpdateCheck)
 		s.lastRes = make(map[domainAndType]*certUpdateResult)
-		s.addError0(errTypeSetecGet)
-		s.addError0(errTypeSetecPut)
-		s.addError0(errTypeSetecActivate)
-		s.addError0(errTypeACMEGetChallenge)
-		s.addError0(errTypeMakeRecord)
-		s.addError0(errTypeACMEFinish)
+
+		s.mOCSPChecks = promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "scertecd_ocsp_checks_total",
+			Help: "Number of OCSP checks broken down by result",
+		}, []string{"result"})
+		s.mCurRenewals = promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "scertecd_current_renewals",
+			Help: "Number of in-flight renewals",
+		})
+		s.mRenewalAttempts = promauto.NewCounter(prometheus.CounterOpts{
+			Name: "scertecd_renewal_attempts_total",
+			Help: "Number of cert renewal attempts",
+		})
+		s.mRenewalErrors = promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "scertecd_renewal_errors_total",
+			Help: "Number of cert renewal errors",
+		}, []string{"error"})
+		s.mSetecReqs = promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "scertecd_setec_requests_total",
+			Help: "Number of requests to setec broken down by operation and status",
+		}, []string{"op", "status"})
+		s.mExpirationTimes = promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "scertecd_domain_expiration_time_seconds",
+			Help: "Expiration time for each domain",
+		}, []string{"domain"})
+		s.mRenewalTimes = promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "scertecd_domain_renewal_time_seconds",
+			Help: "Renewal time for each domain",
+		}, []string{"domain"})
+		s.mOCSPTimes = promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "scertecd_domain_ocsp_check_time_seconds",
+			Help: "Time of last successful OCSP check for each domain",
+		}, []string{"domain"})
+		s.mLastDNSChange = promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "scertecd_last_dns_change_seconds",
+			Help: "Time of last successful DNS change",
+		})
+		s.mDNSChanges = promauto.NewCounter(prometheus.CounterOpts{
+			Name: "scertecd_dns_changes_total",
+			Help: "Total number of successful DNS changes",
+		})
+
+		promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "scertecd_managed_certs",
+			Help: "Number of managed certs",
+		}).Set(float64(len(s.dts)))
+
 	})
 }
 
@@ -229,7 +272,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/":
 		s.serveRoot(w, r)
 	case "/metrics":
-		s.serveMetrics(w, r)
+		promhttp.Handler().ServeHTTP(w, r)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
@@ -302,71 +345,6 @@ const (
 	errTypeCheckCertSetec   = "check-cert-setec"
 )
 
-func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	now := s.Now()
-	uptime := now.Sub(s.startTime)
-
-	good := 0
-	bad := 0
-
-	fmt.Fprintf(w, "uptime %d\n", int64(uptime.Seconds()))
-	add := func(s string, v int64) {
-		fmt.Fprintf(w, "scertecd_%s %d\n", s, v)
-	}
-	add("managed_certs", int64(len(s.dts)))
-
-	for _, dt := range s.dts {
-		res := s.lastRes[dt]
-		if res == nil || res.CertMeta == nil || res.CertMeta.ValidEnd.Before(now) {
-			bad++
-		} else {
-			renewalTime := res.CertMeta.RenewalTime()
-			secRemain := int64(res.CertMeta.ValidEnd.Sub(now).Seconds())
-			secUntilRenew := int64(renewalTime.Sub(now).Seconds())
-			fmt.Fprintf(w, "scertecd_cert_seconds_remain{domain=%q} %v\n", dt, secRemain)
-			fmt.Fprintf(w, "scertecd_cert_seconds_until_renewal{domain=%q} %v\n", dt, max(secUntilRenew, 0))
-			if now.After(renewalTime.Add(15*time.Minute)) || now.Sub(res.LastOCSPCheck) > 30*time.Minute {
-				bad++
-			} else {
-				good++
-			}
-		}
-	}
-	add("certs_cur_good", int64(good))
-	add("certs_cur_bad", int64(bad))
-	add("ocsp_checks_good", s.metricOCSPGood.Value())
-	add("ocsp_checks_revoked", s.metricOCSPRevoked.Value())
-	add("certs_renewals_started", s.metricRenewalsStarted.Value())
-	add("certs_cur_renewals", s.metricCurRenewals.Value())
-	add("setec_get", s.metricSetecGet.Value())
-	add("setec_get_no_change", s.metricSetecGetNoChange.Value())
-	add("made_dns_records", s.metricMadeDNSRecords.Value()) // including tests
-
-	var dnsErrors int64
-	if e, ok := s.metricErrorCount.Get(errTypeMakeRecord).(*expvar.Int); ok {
-		dnsErrors = e.Value()
-	}
-	if uptime < 5*time.Minute && dnsErrors == 0 && s.metricMadeDNSRecords.Value() == 0 {
-		// At startup, don't emit metrics related to DNS errors while the first
-		// test is ongoing,
-	} else {
-		lastTime := s.lastMadeDNSRecord.Load()
-		if lastTime == 0 {
-			add("alert_dns_permission_problem_likely", 1)
-		} else {
-			add("last_dns_record_seconds_ago", now.Unix()-lastTime)
-		}
-	}
-
-	s.metricErrorCount.Do(func(kv expvar.KeyValue) {
-		fmt.Fprintf(w, "scertecd_error{type=%q} %d\n", kv.Key, kv.Value.(*expvar.Int).Value())
-	})
-}
-
 func (s *Server) now() time.Time {
 	if s.Now != nil {
 		return s.Now()
@@ -409,6 +387,10 @@ func (s *Server) renewCertLoop(dt domainAndType) {
 			s.mu.Lock()
 			s.lastRes[dt] = res
 			s.mu.Unlock()
+
+			s.mExpirationTimes.WithLabelValues(dt.String()).Set(float64(res.CertMeta.ValidEnd.Unix()))
+			s.mRenewalTimes.WithLabelValues(dt.String()).Set(float64(res.CertMeta.RenewalTime().Unix()))
+			s.mOCSPTimes.WithLabelValues(dt.String()).Set(float64(res.LastOCSPCheck.Unix()))
 
 			// In the happy path, we just keep checking regularly. The checks
 			// are cheap: just an if-modified-since call to setec. The OCSP checks
@@ -553,14 +535,6 @@ func (s *Server) initACMEReg(ctx context.Context, ac *acme.Client) error {
 	return nil
 }
 
-func (s *Server) addError(errType string) {
-	s.metricErrorCount.Add(errType, 1)
-}
-
-func (s *Server) addError0(errType string) {
-	s.metricErrorCount.Add(errType, 0)
-}
-
 // getSecret fetches a secret from setec, remembering any fetched value so
 // most calls end up doing a GetIfChanged called to setec which results in
 // fewer audit log entries.
@@ -575,15 +549,13 @@ func (s *Server) getSecret(ctx context.Context, secName string) (*api.SecretValu
 	if have != nil {
 		v, err = s.SetecClient.GetIfChanged(ctx, secName, have.Version)
 		if errors.Is(err, api.ErrValueNotChanged) {
-			s.metricSetecGetNoChange.Add(1)
+			s.mSetecReqs.WithLabelValues("get", "no_change").Inc()
 			return have, nil
 		}
 	} else {
 		v, err = s.SetecClient.Get(ctx, secName)
 	}
 	if v != nil {
-		s.metricSetecGet.Add(1)
-
 		s.mu.Lock()
 		if s.secCache == nil {
 			s.secCache = make(map[string]*api.SecretValue)
@@ -591,8 +563,10 @@ func (s *Server) getSecret(ctx context.Context, secName string) (*api.SecretValu
 		s.secCache[secName] = v
 		s.mu.Unlock()
 	}
-	if err != nil {
-		s.addError(errTypeSetecGet)
+	if err != nil && !errors.Is(err, api.ErrNotFound) {
+		s.mSetecReqs.WithLabelValues("get", "error").Inc()
+	} else {
+		s.mSetecReqs.WithLabelValues("get", "ok").Inc()
 	}
 	return v, err
 }
@@ -602,15 +576,18 @@ type logf = func(format string, args ...any)
 func (s *Server) putAndActivateSecret(ctx context.Context, logf logf, secName string, secValue []byte) (api.SecretVersion, error) {
 	v, err := s.SetecClient.Put(ctx, secName, secValue)
 	if err != nil {
-		s.addError(errTypeSetecPut)
+		s.mSetecReqs.WithLabelValues("put", "error").Inc()
 		return 0, fmt.Errorf("could not create %q secret: %w", secName, err)
 	}
+	s.mSetecReqs.WithLabelValues("put", "ok").Inc()
 	logf("created secret %q version %v", secName, v)
+
 	err = s.SetecClient.Activate(ctx, secName, v)
 	if err != nil {
-		s.addError(errTypeSetecActivate)
+		s.mSetecReqs.WithLabelValues("activate", "error").Inc()
 		return 0, fmt.Errorf("could not activate %q version %v: %w", secName, v, err)
 	}
+	s.mSetecReqs.WithLabelValues("activate", "ok").Inc()
 	logf("activated secret %q version %v", secName, v)
 	return v, nil
 }
@@ -662,13 +639,18 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 			if prev == nil || now.Sub(prev.LastOCSPCheck) > 10*time.Minute {
 				if ores, err := cu.s.getOCSPResponse(ctx, m.Leaf, m.Issuer); err != nil {
 					cu.Logf("error fetching OCSP result, ignoring maybe-transient network issue: %v", err)
+					cu.s.mOCSPChecks.WithLabelValues("error").Inc()
 				} else if ores.Status != ocsp.Good {
 					cu.Logf("OCSP status: %v", ores.Status)
-					cu.s.metricOCSPRevoked.Add(1)
+					if ores.Status == ocsp.Revoked {
+						cu.s.mOCSPChecks.WithLabelValues("revoked").Inc()
+					} else {
+						cu.s.mOCSPChecks.WithLabelValues("unknown").Inc()
+					}
 					return nil, fmt.Errorf("OCSP not good; got status=%v, reason=%v, at=%v", ores.Status, ores.RevocationReason, ores.RevokedAt)
 				} else {
 					cu.Logf("OCSP good")
-					cu.s.metricOCSPGood.Add(1)
+					cu.s.mOCSPChecks.WithLabelValues("good").Inc()
 					res.LastOCSPCheck = now
 				}
 			} else {
@@ -681,7 +663,6 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 			cu.Logf("failed to parse cached cert: %v", err)
 		}
 	} else if !errors.Is(err, api.ErrNotFound) {
-		cu.s.addError(errTypeCheckCertSetec)
 		return nil, fmt.Errorf("could not get %q secret: %w", secName, err)
 	}
 
@@ -694,20 +675,20 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 	}
 	defer release()
 
-	cu.s.metricCurRenewals.Add(1)
-	defer cu.s.metricCurRenewals.Add(-1)
-	cu.s.metricRenewalsStarted.Add(1)
+	cu.s.mCurRenewals.Add(1)
+	defer cu.s.mCurRenewals.Sub(1)
+	cu.s.mRenewalAttempts.Inc()
 
 	chal, err := cu.getACMEChallenge(ctx)
 	if err != nil {
-		cu.s.addError(errTypeACMEGetChallenge)
+		cu.s.mRenewalErrors.WithLabelValues(errTypeACMEGetChallenge).Inc()
 		return nil, fmt.Errorf("getACMEChallenge: %w", err)
 	}
 
 	// Make the DNS record we were told to make to prove we control the DNS.
 	err = cu.s.makeRecord(ctx, cu.Logf, chal.dnsRecordName, chal.dnsRecordValue)
 	if err != nil {
-		cu.s.addError(errTypeMakeRecord)
+		cu.s.mRenewalErrors.WithLabelValues(errTypeMakeRecord).Inc()
 		return nil, fmt.Errorf("makeRecord %q: %w", chal.dnsRecordName, err)
 	}
 	cu.Logf("made DNS record %q", chal.dnsRecordName)
@@ -715,18 +696,19 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 	// Finish the ACME dance.
 	allPEM, err := cu.finishACME(ctx, chal)
 	if err != nil {
-		cu.s.addError(errTypeACMEFinish)
+		cu.s.mRenewalErrors.WithLabelValues(errTypeACMEFinish).Inc()
 		return nil, fmt.Errorf("finishACME: %w", err)
 	}
 
 	m, err := cu.s.parseCertMeta(allPEM)
 	if err != nil {
-		cu.s.addError("renewal-parse-new-cert")
+		cu.s.mRenewalErrors.WithLabelValues("renewal-parse-new-cert").Inc()
 		return nil, fmt.Errorf("failed to parse newly fetched cert: %w", err)
 	}
 
 	res.SecretVersion, err = cu.s.putAndActivateSecret(ctx, cu.Logf, secName, allPEM)
 	if err != nil {
+		cu.s.mRenewalErrors.WithLabelValues("put-secret").Inc()
 		return nil, err
 	}
 	res.Updated = true
@@ -1103,8 +1085,9 @@ func (s *Server) makeRecord(ctx context.Context, logf logf, recordName, txtVal s
 		return err
 	}
 
-	s.lastMadeDNSRecord.Store(time.Now().Unix())
-	s.metricMadeDNSRecords.Add(1)
+	s.mLastDNSChange.SetToCurrentTime()
+	s.mDNSChanges.Inc()
+
 	return nil
 }
 
@@ -1125,21 +1108,17 @@ func formatDuration(d time.Duration) string {
 
 func (s *Server) getOCSPResponse(ctx context.Context, leaf, issuer *x509.Certificate) (*ocsp.Response, error) {
 	if leaf == nil {
-		s.addError("ocsp-nil-leaf")
 		return nil, errors.New("nil leaf")
 	}
 	if issuer == nil {
-		s.addError("ocsp-nil-issuer")
 		return nil, errors.New("nil issuer")
 	}
 	if len(leaf.OCSPServer) == 0 {
-		s.addError("ocsp-no-ocsp-server")
 		return nil, errors.New("no OCSP server")
 	}
 
 	reqb, err := ocsp.CreateRequest(leaf, issuer, nil)
 	if err != nil {
-		s.addError("ocsp-create-request")
 		return nil, fmt.Errorf("ocsp.CreateRequest: %w", err)
 	}
 
@@ -1148,29 +1127,24 @@ func (s *Server) getOCSPResponse(ctx context.Context, leaf, issuer *x509.Certifi
 
 	hreq, err := http.NewRequestWithContext(ctx, "POST", leaf.OCSPServer[0], bytes.NewReader(reqb))
 	if err != nil {
-		s.addError("ocsp-new-http-request")
 		return nil, err
 	}
 	hreq.Header.Add("Content-Type", "application/ocsp-request")
 	hreq.Header.Add("Accept", "application/ocsp-response")
 	hres, err := http.DefaultClient.Do(hreq)
 	if err != nil {
-		s.addError("ocsp-http-do")
 		return nil, err
 	}
 	defer hres.Body.Close()
 	if hres.StatusCode != 200 {
-		s.addError("ocsp-http-status")
 		return nil, fmt.Errorf("unexpected HTTP status %v", hres.Status)
 	}
 	ocspRawRes, err := io.ReadAll(io.LimitReader(hres.Body, 1<<20))
 	if err != nil {
-		s.addError("ocsp-read-body")
 		return nil, err
 	}
 	res, err := ocsp.ParseResponse(ocspRawRes, issuer)
 	if err != nil {
-		s.addError("ocsp-parse-response")
 		return nil, err
 	}
 	return res, nil
@@ -1186,7 +1160,6 @@ func (s *Server) checkAWSPermissionsLoop() {
 	for {
 		if err := s.checkAWSPermissions(); err != nil {
 			s.Logf("checkAWSPermissions error: %v", err)
-			s.addError(errTypeMakeRecord)
 		}
 		time.Sleep(1 * time.Hour)
 	}
