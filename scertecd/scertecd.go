@@ -34,6 +34,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,15 +57,15 @@ import (
 // All exported fields must be initialized before calling an exported
 // method on the Server: either UpdateAll or Start.
 type Server struct {
-	SetecClient setec.Client                     // required client for setec
-	Domains     []string                         // domains to maintain certs for
-	Now         func() time.Time                 // if nil, initialized to time.Now
-	ACMEContact string                           // optional email address for ACME registration
-	Prefix      string                           // setec secret prefix ("prod/scertec/")
-	Logf        func(format string, args ...any) // if nil, initialized to log.Printf
+	SetecClient       setec.Client                     // required client for setec
+	Domains           []string                         // domains to maintain certs for
+	DynamicDomainsKey string                           // setec key to read additional domains from, respects Prefix
+	Now               func() time.Time                 // if nil, initialized to time.Now
+	ACMEContact       string                           // optional email address for ACME registration
+	Prefix            string                           // setec secret prefix ("prod/scertec/")
+	Logf              func(format string, args ...any) // if nil, initialized to log.Printf
 
-	lazyInitOnce sync.Once // guards dts and optional fields above
-	dts          []domainAndType
+	lazyInitOnce sync.Once // guards optional fields above
 	startTime    time.Time // time the server was started, for metrics
 
 	metricOCSPGood         expvar.Int
@@ -78,6 +79,8 @@ type Server struct {
 	lastMadeDNSRecord      atomic.Int64 // unix time of last successful DNS record made
 
 	mu             sync.Mutex
+	lastDynVers    api.SecretVersion
+	dts            []domainAndType
 	acLazy         *acme.Client // nil until needed via getACMEClient
 	lastOrCurCheck map[domainAndType]*certUpdateCheck
 	lastRes        map[domainAndType]*certUpdateResult
@@ -90,7 +93,7 @@ func (s *Server) lazyInit() {
 		s.startTime = time.Now()
 		for _, d := range s.Domains {
 			for _, typ := range []CertType{RSACert, ECDSACert} {
-				s.dts = append(s.dts, domainAndType{d, typ})
+				s.dts = append(s.dts, domainAndType{d, typ, false})
 			}
 		}
 		if s.Logf == nil {
@@ -110,13 +113,84 @@ func (s *Server) lazyInit() {
 	})
 }
 
+// updateDynamicDomainList updates Server's knowledge of additional
+// domains, dynamically fetched from setec.
+func (s *Server) updateDynamicDomainList(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sec, err := s.SetecClient.GetIfChanged(ctx, s.Prefix+s.DynamicDomainsKey, s.lastDynVers)
+	switch {
+	case errors.Is(err, api.ErrNotFound):
+		s.Logf("additional domains key %q not present on setec, skipping updating the domains list", s.DynamicDomainsKey)
+		return nil
+	case errors.Is(err, api.ErrValueNotChanged):
+		return nil
+	case err != nil:
+		return err
+	}
+	s.lastDynVers = sec.Version
+
+	// Build a map describing the set of additional domains,
+	// and if we saw them represented in dts.
+	addlDomains := make(map[string]bool)
+	for _, domain := range strings.Split(string(sec.Value), ",") {
+		domain = strings.TrimSpace(domain)
+		if domain == "" {
+			continue
+		}
+		addlDomains[domain] = false
+	}
+
+	var dts []domainAndType
+	for _, d := range s.dts {
+		// We don't want to touch hardcoded domains so skip over non-dynamic entries.
+		if !d.dynamic {
+			dts = append(dts, d)
+			continue
+		}
+
+		if _, ok := addlDomains[d.domain]; ok {
+			// entry is still part of the additional domains set, keep it
+			dts = append(dts, d)
+			addlDomains[d.domain] = true // entry exists for domain
+		} else {
+			// entry is not part of additional domains set, do not
+			// append to new slice. This effectively deletes it from s.dts.
+		}
+	}
+	// Add any newly-seen additional domains to dts.
+	for d, entryExists := range addlDomains {
+		if !entryExists {
+			for _, typ := range []CertType{RSACert, ECDSACert} {
+				dts = append(dts, domainAndType{d, typ, true})
+			}
+		}
+	}
+
+	s.dts = dts
+	return nil
+}
+
 // UpdateAll checks or updates all certs once and returns.
+//
+// If DynamicDomainsKey is set, the list of additional domains to
+// maintain certs for is fetched from setec.
 //
 // If all certs are either fine or successfully updated, it returns nil.
 //
 // It is not necessary to call Start before UpdateAll.
 func (s *Server) UpdateAll() error {
 	s.lazyInit()
+
+	if s.DynamicDomainsKey != "" {
+		err := s.updateDynamicDomainList(context.Background())
+		if err != nil {
+			s.Logf("updateDynamicDomainList error: %v", err)
+			return err
+		}
+	}
+
 	for _, dt := range s.dts {
 		cu := s.newCertUpdateCheck(dt)
 		st, err := cu.updateIfNeeded(context.Background(), nil)
@@ -140,10 +214,45 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	go s.checkAWSPermissionsLoop()
-	for _, dt := range s.dts {
-		go s.renewCertLoop(dt)
-	}
+	go s.renewCertsLoop()
 	return nil
+}
+
+// renewCertsLoop periodically ensures the certificates scertecd is monitoring are
+// valid.
+//
+// If DynamicDomainsKey is set, the list of additional domains is also updated
+// periodically.
+func (s *Server) renewCertsLoop() {
+	for {
+		// Refresh our understanding of any dynamic domains.
+		if s.DynamicDomainsKey != "" {
+			// Set a long timeout, just so we progress eventually even if there
+			// is an issue.
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			if err := s.updateDynamicDomainList(ctx); err != nil {
+				s.Logf("updateDynamicDomainList error: %v", err)
+			}
+			cancel()
+		}
+
+		// Grab a copy of the list of certs we should do renewal runs for, in da lock.
+		s.mu.Lock()
+		dts := slices.Clone(s.dts)
+		s.mu.Unlock()
+
+		var wg sync.WaitGroup
+		for _, dt := range dts {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				s.renewCertRun(dt)
+			}()
+		}
+		// renewCertRun sleeps for a minute (as of 2024-03-11), we rely on
+		// that to avoid this loop being hot / pummelling APIs.
+		wg.Wait()
+	}
 }
 
 // acquireDomainRenewalLock acquires a lock for the given domain name,
@@ -384,46 +493,45 @@ func (s *Server) newCertUpdateCheck(dt domainAndType) *certUpdateCheck {
 	return cu
 }
 
-func (s *Server) renewCertLoop(dt domainAndType) {
-	for {
-		cu := s.newCertUpdateCheck(dt)
+func (s *Server) renewCertRun(dt domainAndType) {
+	cu := s.newCertUpdateCheck(dt)
 
+	s.mu.Lock()
+	prev := s.lastOrCurCheck[dt]
+	s.lastOrCurCheck[dt] = cu
+	s.mu.Unlock()
+
+	var prevRes *certUpdateResult
+	if prev != nil {
+		prevRes = prev.res
+	}
+
+	res, err := cu.updateIfNeeded(context.Background(), prevRes)
+	if err != nil {
+		cu.lg.Printf("updateIfNeeded error: %v", err)
+		// In case we violated some rate limit, sleep a bit. We should be
+		// looking at acme response headers/errors more but in the meantime,
+		// just conservatively sleep more than hopefully necessary.
+		time.Sleep(5 * time.Minute)
+	} else {
 		s.mu.Lock()
-		prev := s.lastOrCurCheck[dt]
-		s.lastOrCurCheck[dt] = cu
+		s.lastRes[dt] = res
 		s.mu.Unlock()
 
-		var prevRes *certUpdateResult
-		if prev != nil {
-			prevRes = prev.res
-		}
-
-		res, err := cu.updateIfNeeded(context.Background(), prevRes)
-		if err != nil {
-			cu.lg.Printf("updateIfNeeded error: %v", err)
-			// In case we violated some rate limit, sleep a bit. We should be
-			// looking at acme response headers/errors more but in the meantime,
-			// just conservatively sleep more than hopefully necessary.
-			time.Sleep(5 * time.Minute)
-		} else {
-			s.mu.Lock()
-			s.lastRes[dt] = res
-			s.mu.Unlock()
-
-			// In the happy path, we just keep checking regularly. The checks
-			// are cheap: just an if-modified-since call to setec. The OCSP checks
-			// will be skipped if it was done recently enough (per prevRes).
-			cu.lg.Printf("success; %+v", res)
-			time.Sleep(1 * time.Minute)
-		}
+		// In the happy path, we just keep checking regularly. The checks
+		// are cheap: just an if-modified-since call to setec. The OCSP checks
+		// will be skipped if it was done recently enough (per prevRes).
+		cu.lg.Printf("success; %+v", res)
+		time.Sleep(1 * time.Minute)
 	}
 }
 
 // domainAndType is a domain name and a cert algorithm type for that domain
 // name. It's a value type, for use as a map key.
 type domainAndType struct {
-	domain string
-	typ    CertType
+	domain  string
+	typ     CertType
+	dynamic bool // set if discovered via s.DynamicDomainsKey
 }
 
 func (dt domainAndType) String() string {
