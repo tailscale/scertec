@@ -1187,8 +1187,14 @@ func (s *Server) checkAWSPermissionsLoop() {
 		if err := s.checkAWSPermissions(); err != nil {
 			s.Logf("checkAWSPermissions error: %v", err)
 			s.addError(errTypeMakeRecord)
+
+			// If we failed to make a record, try again in a few minutes.
+			// This lets us distinguish between a transient error and a more
+			// persistent issue in alerting.
+			time.Sleep(10 * time.Minute)
+		} else {
+			time.Sleep(1 * time.Hour)
 		}
-		time.Sleep(1 * time.Hour)
 	}
 }
 
