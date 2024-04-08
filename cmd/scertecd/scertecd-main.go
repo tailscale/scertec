@@ -21,12 +21,13 @@ import (
 )
 
 var (
-	setecURL    = flag.String("setec-url", "", "URL of setec secrets server")
-	acmeContact = flag.String("acme-contact", "", "ACME contact email address (optional)")
-	prefix      = flag.String("prefix", "dev/scertec/", "setec secret prefix to put certs under (with suffixes DOMAIN/rsa and DOMAIN/ecdsa); must end in a slash")
-	domains     = flag.String("domain-names", "", "Comma-separated list of domain names to get certs for")
-	foreground  = flag.Bool("foreground", false, "run in the foreground and update all the --domains if needed and exit but don't run an HTTP server")
-	listen      = flag.String("listen", ":8081", "address to listen on (if not in foreground mode)")
+	setecURL      = flag.String("setec-url", "", "URL of setec secrets server")
+	acmeContact   = flag.String("acme-contact", "", "ACME contact email address (optional)")
+	prefix        = flag.String("prefix", "dev/scertec/", "setec secret prefix to put certs under (with suffixes DOMAIN/rsa and DOMAIN/ecdsa); must end in a slash")
+	domains       = flag.String("domain-names", "", "Comma-separated list of domain names to get certs for")
+	foreground    = flag.Bool("foreground", false, "run in the foreground and update all the --domains if needed and exit but don't run an HTTP server")
+	listen        = flag.String("listen", ":8081", "address to listen on (if not in foreground mode)")
+	dynDomainsKey = flag.String("dynamic-domains-secret", "", "setec key to fetch comma-separated list of additional domains from (optional)")
 )
 
 func main() {
@@ -43,10 +44,11 @@ func main() {
 	}
 
 	s := &scertecd.Server{
-		SetecClient: setec.Client{Server: *setecURL},
-		Domains:     strings.Split(*domains, ","),
-		ACMEContact: *acmeContact,
-		Prefix:      *prefix,
+		SetecClient:       setec.Client{Server: *setecURL},
+		Domains:           strings.Split(*domains, ","),
+		DynamicDomainsKey: *dynDomainsKey,
+		ACMEContact:       *acmeContact,
+		Prefix:            *prefix,
 	}
 	if *foreground {
 		if err := s.UpdateAll(); err != nil {
