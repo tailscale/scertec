@@ -1004,24 +1004,33 @@ func (s *Server) makeRecord(ctx context.Context, logf logf, recordName, txtVal s
 	// but we also don't get new cert often. But we could cache them and then
 	// only reload on miss.
 	var hostedZoneID string
-	err := svc.ListHostedZonesPagesWithContext(ctx, &route53.ListHostedZonesInput{
-		MaxItems: aws.String("100"),
-	}, func(page *route53.ListHostedZonesOutput, lastPage bool) bool {
-		for _, hz := range page.HostedZones {
-			if hz.Name == nil || *hz.Name == "local." {
-				continue
+	var nextMarker *string
+	for {
+		err := svc.ListHostedZonesPagesWithContext(ctx, &route53.ListHostedZonesInput{
+			MaxItems: aws.String("100"),
+			Marker:   nextMarker,
+		}, func(page *route53.ListHostedZonesOutput, lastPage bool) bool {
+			for _, hz := range page.HostedZones {
+				if hz.Name == nil || *hz.Name == "local." {
+					continue
+				}
+				if strings.HasSuffix(recordName, "."+strings.TrimSuffix(*hz.Name, ".")) {
+					hostedZoneID = path.Base(*hz.Id) // map "/hostedzone/ZFOO" to "ZFOO"
+					logf("matched hosted zone %q (%s)", *hz.Name, hostedZoneID)
+					return false // stop
+				}
 			}
-			if strings.HasSuffix(recordName, "."+strings.TrimSuffix(*hz.Name, ".")) {
-				hostedZoneID = path.Base(*hz.Id) // map "/hostedzone/ZFOO" to "ZFOO"
-				logf("matched hosted zone %q (%s)", *hz.Name, hostedZoneID)
-				return false // stop
-			}
+			nextMarker = page.NextMarker
+			return true // continue
+		})
+		if err != nil {
+			return err
 		}
-		return true // continue
-	})
-	if err != nil {
-		return err
+		if hostedZoneID != "" || nextMarker == nil {
+			break
+		}
 	}
+
 	if hostedZoneID == "" {
 		return fmt.Errorf("unknown hosted zone for %q", recordName)
 	}
