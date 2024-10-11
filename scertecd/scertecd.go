@@ -752,7 +752,7 @@ func (cu *certUpdateCheck) finishACME(ctx context.Context, ci *acmeChallengeInfo
 			return nil, ctx.Err()
 		}
 		if oe, ok := err.(*acme.OrderError); ok {
-			cu.Logf("WaitOrder: OrderError status %q", oe.Status)
+			cu.Logf("WaitOrder: OrderError status %q; err=%s", oe.Status, oe.Error())
 		} else {
 			cu.Logf("WaitOrder error: %v", err)
 		}
