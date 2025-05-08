@@ -45,7 +45,6 @@ import (
 	"github.com/tailscale/setec/client/setec"
 	"github.com/tailscale/setec/types/api"
 	"golang.org/x/crypto/acme"
-	"golang.org/x/crypto/ocsp"
 )
 
 // Server is the scertec updater server.
@@ -67,8 +66,6 @@ type Server struct {
 	dts          []domainAndType
 	startTime    time.Time // time the server was started, for metrics
 
-	metricOCSPGood         expvar.Int
-	metricOCSPRevoked      expvar.Int
 	metricErrorCount       expvar.Map // error type => count
 	metricRenewalsStarted  expvar.Int // counter of renewal started
 	metricCurRenewals      expvar.Int // gauge of in-flight renewals
@@ -329,7 +326,7 @@ func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
 			secUntilRenew := int64(renewalTime.Sub(now).Seconds())
 			fmt.Fprintf(w, "scertecd_cert_seconds_remain{domain=%q} %v\n", dt, secRemain)
 			fmt.Fprintf(w, "scertecd_cert_seconds_until_renewal{domain=%q} %v\n", dt, max(secUntilRenew, 0))
-			if now.After(renewalTime.Add(15*time.Minute)) || now.Sub(res.LastOCSPCheck) > 30*time.Minute {
+			if now.After(renewalTime.Add(15 * time.Minute)) {
 				bad++
 			} else {
 				good++
@@ -338,8 +335,6 @@ func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	add("certs_cur_good", int64(good))
 	add("certs_cur_bad", int64(bad))
-	add("ocsp_checks_good", s.metricOCSPGood.Value())
-	add("ocsp_checks_revoked", s.metricOCSPRevoked.Value())
 	add("certs_renewals_started", s.metricRenewalsStarted.Value())
 	add("certs_cur_renewals", s.metricCurRenewals.Value())
 	add("setec_get", s.metricSetecGet.Value())
@@ -411,8 +406,7 @@ func (s *Server) renewCertLoop(dt domainAndType) {
 			s.mu.Unlock()
 
 			// In the happy path, we just keep checking regularly. The checks
-			// are cheap: just an if-modified-since call to setec. The OCSP checks
-			// will be skipped if it was done recently enough (per prevRes).
+			// are cheap: just an if-modified-since call to setec.
 			cu.lg.Printf("success; %+v", res)
 			time.Sleep(1 * time.Minute)
 		}
@@ -621,7 +615,6 @@ type certUpdateResult struct {
 	CertMeta      *certMeta
 	SecretName    string
 	SecretVersion api.SecretVersion
-	LastOCSPCheck time.Time
 }
 
 // updateIfNeeded checks if the cert for cu.dt needs updating and fetches a new
@@ -654,26 +647,8 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 		m, err := cu.s.parseCertMeta(sec.Value)
 		switch {
 		case err == nil:
-			// It still has enough time left. The common case.
 			res.SecretVersion = sec.Version
 			res.CertMeta = m
-
-			now := cu.s.Now()
-			if prev == nil || now.Sub(prev.LastOCSPCheck) > 10*time.Minute {
-				if ores, err := cu.s.getOCSPResponse(ctx, m.Leaf, m.Issuer); err != nil {
-					cu.Logf("error fetching OCSP result, ignoring maybe-transient network issue: %v", err)
-				} else if ores.Status != ocsp.Good {
-					cu.Logf("OCSP status: %v", ores.Status)
-					cu.s.metricOCSPRevoked.Add(1)
-					return nil, fmt.Errorf("OCSP not good; got status=%v, reason=%v, at=%v", ores.Status, ores.RevocationReason, ores.RevokedAt)
-				} else {
-					cu.Logf("OCSP good")
-					cu.s.metricOCSPGood.Add(1)
-					res.LastOCSPCheck = now
-				}
-			} else {
-				res.LastOCSPCheck = prev.LastOCSPCheck
-			}
 			return res, nil
 		case err == errNeedNewCert:
 			cu.Logf("insufficient remaining time; fetching a new one")
@@ -1121,59 +1096,6 @@ func formatDuration(d time.Duration) string {
 		s = d.String()
 	}
 	return strings.TrimSuffix(s, "0s")
-}
-
-func (s *Server) getOCSPResponse(ctx context.Context, leaf, issuer *x509.Certificate) (*ocsp.Response, error) {
-	if leaf == nil {
-		s.addError("ocsp-nil-leaf")
-		return nil, errors.New("nil leaf")
-	}
-	if issuer == nil {
-		s.addError("ocsp-nil-issuer")
-		return nil, errors.New("nil issuer")
-	}
-	if len(leaf.OCSPServer) == 0 {
-		s.addError("ocsp-no-ocsp-server")
-		return nil, errors.New("no OCSP server")
-	}
-
-	reqb, err := ocsp.CreateRequest(leaf, issuer, nil)
-	if err != nil {
-		s.addError("ocsp-create-request")
-		return nil, fmt.Errorf("ocsp.CreateRequest: %w", err)
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	hreq, err := http.NewRequestWithContext(ctx, "POST", leaf.OCSPServer[0], bytes.NewReader(reqb))
-	if err != nil {
-		s.addError("ocsp-new-http-request")
-		return nil, err
-	}
-	hreq.Header.Add("Content-Type", "application/ocsp-request")
-	hreq.Header.Add("Accept", "application/ocsp-response")
-	hres, err := http.DefaultClient.Do(hreq)
-	if err != nil {
-		s.addError("ocsp-http-do")
-		return nil, err
-	}
-	defer hres.Body.Close()
-	if hres.StatusCode != 200 {
-		s.addError("ocsp-http-status")
-		return nil, fmt.Errorf("unexpected HTTP status %v", hres.Status)
-	}
-	ocspRawRes, err := io.ReadAll(io.LimitReader(hres.Body, 1<<20))
-	if err != nil {
-		s.addError("ocsp-read-body")
-		return nil, err
-	}
-	res, err := ocsp.ParseResponse(ocspRawRes, issuer)
-	if err != nil {
-		s.addError("ocsp-parse-response")
-		return nil, err
-	}
-	return res, nil
 }
 
 // checkAWSPermissionsLoop is a background goroutine that periodically checks
