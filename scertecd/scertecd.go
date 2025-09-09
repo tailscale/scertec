@@ -31,6 +31,8 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"math"
+	"math/big"
 	"net/http"
 	"os"
 	"path"
@@ -55,12 +57,14 @@ import (
 // All exported fields must be initialized before calling an exported
 // method on the Server: either UpdateAll or Start.
 type Server struct {
-	SetecClient setec.Client                     // required client for setec
-	Domains     []string                         // domains to maintain certs for
-	Now         func() time.Time                 // if nil, initialized to time.Now
-	ACMEContact string                           // optional email address for ACME registration
-	Prefix      string                           // setec secret prefix ("prod/scertec/")
-	Logf        func(format string, args ...any) // if nil, initialized to log.Printf
+	SetecClient    setec.Client                     // required client for setec
+	PublicDomains  []string                         // domains to maintain public Let's Encrypt certs for
+	PrivateDomains []string                         // domains to maintain private CA certs for
+	ActiveRoot     string                           // if non-empty, use private key at roots/${ActiveRoot} to sign private certs
+	Now            func() time.Time                 // if nil, initialized to time.Now
+	ACMEContact    string                           // optional email address for ACME registration
+	Prefix         string                           // setec secret prefix ("prod/scertec/")
+	Logf           func(format string, args ...any) // if nil, initialized to log.Printf
 
 	lazyInitOnce sync.Once // guards dts and optional fields above
 	dts          []domainAndType
@@ -85,9 +89,14 @@ type Server struct {
 func (s *Server) lazyInit() {
 	s.lazyInitOnce.Do(func() {
 		s.startTime = time.Now()
-		for _, d := range s.Domains {
+		for _, d := range s.PublicDomains {
 			for _, typ := range []CertType{RSACert, ECDSACert} {
-				s.dts = append(s.dts, domainAndType{d, typ})
+				s.dts = append(s.dts, domainAndType{d, typ, false})
+			}
+		}
+		for _, d := range s.PrivateDomains {
+			for _, typ := range []CertType{RSACert, ECDSACert} {
+				s.dts = append(s.dts, domainAndType{d, typ, true})
 			}
 		}
 		if s.Logf == nil {
@@ -416,8 +425,9 @@ func (s *Server) renewCertLoop(dt domainAndType) {
 // domainAndType is a domain name and a cert algorithm type for that domain
 // name. It's a value type, for use as a map key.
 type domainAndType struct {
-	domain string
-	typ    CertType
+	domain    string
+	typ       CertType
+	privateCA bool // if true, use private CA instead of Let's Encrypt
 }
 
 func (dt domainAndType) String() string {
@@ -641,10 +651,12 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 	}
 	cu.res = res
 
-	// See if we have an existing cert in setec that still has sufficient
-	// remaining expiry time.
+	// Check if there is an existing certificate in setec with enough remaining
+	// validity. If the previous certificate was issued by Let's Encrypt and
+	// the current configuration uses the private CA (or the reverse), this
+	// check will fail due to a mismatch in the expected number of PEM blocks.
 	if sec, err := cu.s.getSecret(ctx, secName); err == nil {
-		m, err := cu.s.parseCertMeta(sec.Value)
+		m, err := cu.s.parseCertMeta(sec.Value, cu.dt.privateCA)
 		switch {
 		case err == nil:
 			res.SecretVersion = sec.Version
@@ -660,12 +672,137 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 		return nil, fmt.Errorf("could not get %q secret: %w", secName, err)
 	}
 
+	if cu.dt.privateCA {
+		if err := cu.privateCARenewal(ctx, secName); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := cu.acmeRenewal(ctx, secName); err != nil {
+			return nil, err
+		}
+	}
+	return cu.res, nil
+}
+
+// privateCARenewal creates a new cert signed by the active private root. The
+// resulting PEM-encoded private key and certificate will be stored in setec
+// under secName.
+func (cu *certUpdateCheck) privateCARenewal(ctx context.Context, secName string) error {
+	privKey, err := cu.genCertPrivateKey()
+	if err != nil {
+		return err
+	}
+
+	// create a certificate to be signed
+	newCert, err := cu.newCert()
+	if err != nil {
+		return err
+	}
+
+	// write the private key to the PEM output
+	var allPEM bytes.Buffer
+	if err := encodePrivateKeyPEM(&allPEM, privKey); err != nil {
+		return err
+	}
+
+	// sign the new cert with the active CA root.
+	derBytes, err := cu.signWithRoot(ctx, cu.s.ActiveRoot, newCert, privKey)
+	if err != nil {
+		cu.s.addError("private-renewal-sign-with-root")
+		return fmt.Errorf("failed to sign new cert with root %q: %w", cu.s.ActiveRoot, err)
+	}
+	pb := &pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: derBytes,
+	}
+	if err := pem.Encode(&allPEM, pb); err != nil {
+		cu.s.addError("private-renewal-pem-encode")
+		return fmt.Errorf("failed to PEM encode cert signed by root %q: %w", cu.s.ActiveRoot, err)
+	}
+
+	// ensure that we can parse the resulting key/cert bundle.
+	m, err := cu.s.parseCertMeta(allPEM.Bytes(), true)
+	if err != nil {
+		cu.s.addError("private-renewal-parse-new-cert")
+		return fmt.Errorf("failed to parse newly fetched cert: %w", err)
+	}
+
+	cu.res.SecretVersion, err = cu.s.putAndActivateSecret(ctx, cu.Logf, secName, allPEM.Bytes())
+	if err != nil {
+		return err
+	}
+	cu.res.Updated = true
+	cu.res.CertMeta = m
+	return nil
+}
+
+// signWithRoot signs newCert with the root CA identified by rootPrivKeySecName,
+// using newKey as the private key for newCert. The returned byte slice contains
+// the DER-encoded signed certificate.
+func (cu *certUpdateCheck) signWithRoot(ctx context.Context, rootPrivKeySecName string, newCert *x509.Certificate, newKey crypto.Signer) ([]byte, error) {
+	// retrieve root private key; PEM decode & parse it
+	caPrivKeyName := path.Join(cu.s.Prefix, "roots", "private-key")
+	caPrivKeySecret, err := cu.s.getSecret(ctx, caPrivKeyName)
+	if err != nil {
+		return nil, fmt.Errorf("getSecret %q: %w", caPrivKeyName, err)
+	}
+	keyPB, rest := pem.Decode(caPrivKeySecret.Value)
+	if keyPB == nil {
+		return nil, fmt.Errorf("pem.Decode %q: no PEM data found", caPrivKeyName)
+	}
+	if len(rest) > 0 {
+		return nil, fmt.Errorf("pem.Decode: %q: unexpected trailing data after key PEM block", caPrivKeyName)
+	}
+	caPrivKey, err := x509.ParsePKCS8PrivateKey(keyPB.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse private key %q: %v", caPrivKeyName, err)
+	}
+
+	// retrieve root certificate; PEM decode & parse it
+	caCertName := path.Join(cu.s.Prefix, "roots", rootPrivKeySecName, "certificate-latest")
+	caCertSecret, err := cu.s.getSecret(ctx, caCertName)
+	if err != nil {
+		return nil, fmt.Errorf("getSecret %q: %w", caCertName, err)
+	}
+	certPB, _ := pem.Decode(caCertSecret.Value)
+	if certPB == nil {
+		return nil, fmt.Errorf("pem.Decode %q: no PEM data found", caCertName)
+	}
+	caCert, err := x509.ParseCertificate(certPB.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parsePEMCertificates %q: %w", caCertName, err)
+	}
+
+	// sign the new certificate with the root private key
+	return x509.CreateCertificate(rand.Reader, newCert, caCert, newKey.Public(), caPrivKey)
+}
+
+func (cu *certUpdateCheck) newCert() (*x509.Certificate, error) {
+	n, err := rand.Int(rand.Reader, big.NewInt(math.MaxInt64))
+	if err != nil {
+		return nil, fmt.Errorf("unable to generate serial number: %w", err)
+	}
+
+	return &x509.Certificate{
+		SerialNumber: n,
+		DNSNames:     []string{cu.dt.domain},
+		Subject: pkix.Name{
+			Organization: []string{"Tailscale, Inc."},
+			CommonName:   cu.dt.domain,
+		},
+		NotBefore:   cu.s.Now(),
+		NotAfter:    cu.s.Now().Add(30 * 24 * time.Hour), // valid for 30 days
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+	}, nil
+}
+
+func (cu *certUpdateCheck) acmeRenewal(ctx context.Context, secName string) error {
 	// We need a new cert. Start the ACME dns-01 dance and get a challenge. But
 	// only permit one renewal per DNS name at a time, so our TXT records don't
 	// fight (https://github.com/tailscale/scertec/issues/4).
 	release, err := cu.s.acquireDomainRenewalLock(ctx, cu.Logf, cu.dt.domain)
 	if err != nil {
-		return nil, fmt.Errorf("acquireDomainRenewalLock: %w", err)
+		return fmt.Errorf("acquireDomainRenewalLock: %w", err)
 	}
 	defer release()
 
@@ -676,14 +813,14 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 	chal, err := cu.getACMEChallenge(ctx)
 	if err != nil {
 		cu.s.addError(errTypeACMEGetChallenge)
-		return nil, fmt.Errorf("getACMEChallenge: %w", err)
+		return fmt.Errorf("getACMEChallenge: %w", err)
 	}
 
 	// Make the DNS record we were told to make to prove we control the DNS.
 	err = cu.s.makeRecord(ctx, cu.Logf, chal.dnsRecordName, chal.dnsRecordValue)
 	if err != nil {
 		cu.s.addError(errTypeMakeRecord)
-		return nil, fmt.Errorf("makeRecord %q: %w", chal.dnsRecordName, err)
+		return fmt.Errorf("makeRecord %q: %w", chal.dnsRecordName, err)
 	}
 	cu.Logf("made DNS record %q", chal.dnsRecordName)
 
@@ -691,22 +828,22 @@ func (cu *certUpdateCheck) updateIfNeeded(ctx context.Context, prev *certUpdateR
 	allPEM, err := cu.finishACME(ctx, chal)
 	if err != nil {
 		cu.s.addError(errTypeACMEFinish)
-		return nil, fmt.Errorf("finishACME: %w", err)
+		return fmt.Errorf("finishACME: %w", err)
 	}
 
-	m, err := cu.s.parseCertMeta(allPEM)
+	m, err := cu.s.parseCertMeta(allPEM, false) /* false = not private CA */
 	if err != nil {
 		cu.s.addError("renewal-parse-new-cert")
-		return nil, fmt.Errorf("failed to parse newly fetched cert: %w", err)
+		return fmt.Errorf("failed to parse newly fetched cert: %w", err)
 	}
 
-	res.SecretVersion, err = cu.s.putAndActivateSecret(ctx, cu.Logf, secName, allPEM)
+	cu.res.SecretVersion, err = cu.s.putAndActivateSecret(ctx, cu.Logf, secName, allPEM)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	res.Updated = true
-	res.CertMeta = m
-	return res, nil
+	cu.res.Updated = true
+	cu.res.CertMeta = m
+	return nil
 }
 
 func (cu *certUpdateCheck) finishACME(ctx context.Context, ci *acmeChallengeInfo) (allPEM []byte, err error) {
@@ -846,7 +983,7 @@ func (m *certMeta) RenewalTime() time.Time {
 // and returns metadata about the validity window of the cert(s).
 // If we're over 2/3rds of the way through its validity period, it returns
 // it returns (non-nil, errNeedNewCert).
-func (s *Server) parseCertMeta(p []byte) (*certMeta, error) {
+func (s *Server) parseCertMeta(p []byte, privateCA bool) (*certMeta, error) {
 	m := &certMeta{}
 	var blocks []*pem.Block
 	for {
@@ -860,8 +997,14 @@ func (s *Server) parseCertMeta(p []byte) (*certMeta, error) {
 	if len(blocks) == 0 {
 		return nil, errors.New("no PEM blocks found")
 	}
-	if len(blocks) < 3 {
-		return nil, errors.New("not enough PEM blocks found")
+	if privateCA {
+		if len(blocks) < 2 {
+			return nil, errors.New("not enough PEM blocks found for private CA cert")
+		}
+	} else {
+		if len(blocks) < 3 {
+			return nil, errors.New("not enough PEM blocks found for LE cert")
+		}
 	}
 	if !strings.HasSuffix(blocks[0].Type, " PRIVATE KEY") {
 		return nil, errors.New("first PEM block is not a private key")

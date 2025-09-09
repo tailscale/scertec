@@ -43,10 +43,10 @@ func main() {
 	}
 
 	s := &scertecd.Server{
-		SetecClient: setec.Client{Server: *setecURL},
-		Domains:     strings.Split(*domains, ","),
-		ACMEContact: *acmeContact,
-		Prefix:      *prefix,
+		SetecClient:   setec.Client{Server: *setecURL},
+		PublicDomains: strings.Split(*domains, ","),
+		ACMEContact:   *acmeContact,
+		Prefix:        *prefix,
 	}
 	if *foreground {
 		if err := s.UpdateAll(); err != nil {
