@@ -218,7 +218,17 @@ var tmpls = template.Must(template.New("root").Parse(`
 <html><h1>scertecd</h1>
 [<a href="/metrics">metrics</a>]
 <table border=1 cellpadding=5>
-{{range .Certs}}
+<h2>Private CA certs</h2>
+{{range .PrivateCerts}}
+   <tr>
+       <td><b>{{.Name}}</b>
+	   <td>{{.Status}}
+	       {{if .Log}}<pre>{{.Log}}</pre>{{end}}
+	   </td>
+   </tr>
+{{end}}
+<h2>Public Let's Encrypt certs</h2>
+{{range .PublicCerts}}
    <tr>
        <td><b>{{.Name}}</b>
 	   <td>{{.Status}}
@@ -250,7 +260,8 @@ func (s *Server) serveRoot(w http.ResponseWriter, r *http.Request) {
 		SHA256  string
 	}
 	var data struct {
-		Certs []certData
+		PublicCerts  []certData
+		PrivateCerts []certData
 	}
 	now := s.now()
 	addRow := func(cu *certUpdateCheck) {
@@ -281,7 +292,11 @@ func (s *Server) serveRoot(w http.ResponseWriter, r *http.Request) {
 			cd.Version = int(cu.res.SecretVersion)
 			cd.SHA256 = fmt.Sprintf("%x", sha256.Sum256(cu.res.CertMeta.Leaf.Raw))
 		}
-		data.Certs = append(data.Certs, cd)
+		if cu.dt.privateCA {
+			data.PrivateCerts = append(data.PrivateCerts, cd)
+		} else {
+			data.PublicCerts = append(data.PublicCerts, cd)
+		}
 	}
 
 	for _, dt := range s.dts {
