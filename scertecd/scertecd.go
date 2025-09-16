@@ -60,7 +60,6 @@ type Server struct {
 	SetecClient    setec.Client                     // required client for setec
 	PublicDomains  []string                         // domains to maintain public Let's Encrypt certs for
 	PrivateDomains []string                         // domains to maintain private CA certs for
-	ActiveRoot     string                           // if non-empty, use private key at roots/${ActiveRoot} to sign private certs
 	Now            func() time.Time                 // if nil, initialized to time.Now
 	ACMEContact    string                           // optional email address for ACME registration
 	Prefix         string                           // setec secret prefix ("prod/scertec/")
@@ -721,10 +720,10 @@ func (cu *certUpdateCheck) privateCARenewal(ctx context.Context, secName string)
 	}
 
 	// sign the new cert with the active CA root.
-	derBytes, err := cu.signWithRoot(ctx, cu.s.ActiveRoot, newCert, privKey)
+	derBytes, err := cu.signWithPrivateRoot(ctx, newCert, privKey)
 	if err != nil {
 		cu.s.addError("private-renewal-sign-with-root")
-		return fmt.Errorf("failed to sign new cert with root %q: %w", cu.s.ActiveRoot, err)
+		return fmt.Errorf("failed to sign new cert with private root %w", err)
 	}
 	pb := &pem.Block{
 		Type:  "CERTIFICATE",
@@ -732,7 +731,7 @@ func (cu *certUpdateCheck) privateCARenewal(ctx context.Context, secName string)
 	}
 	if err := pem.Encode(&allPEM, pb); err != nil {
 		cu.s.addError("private-renewal-pem-encode")
-		return fmt.Errorf("failed to PEM encode cert signed by root %q: %w", cu.s.ActiveRoot, err)
+		return fmt.Errorf("failed to PEM encode cert signed by private root: %w", err)
 	}
 
 	// ensure that we can parse the resulting key/cert bundle.
@@ -751,10 +750,10 @@ func (cu *certUpdateCheck) privateCARenewal(ctx context.Context, secName string)
 	return nil
 }
 
-// signWithRoot signs newCert with the root CA identified by rootPrivKeySecName,
+// signWithPrivateRoot signs newCert with the root CA identified by rootPrivKeySecName,
 // using newKey as the private key for newCert. The returned byte slice contains
 // the DER-encoded signed certificate.
-func (cu *certUpdateCheck) signWithRoot(ctx context.Context, rootPrivKeySecName string, newCert *x509.Certificate, newKey crypto.Signer) ([]byte, error) {
+func (cu *certUpdateCheck) signWithPrivateRoot(ctx context.Context, newCert *x509.Certificate, newKey crypto.Signer) ([]byte, error) {
 	// retrieve root private key; PEM decode & parse it
 	caPrivKeyName := path.Join(cu.s.Prefix, "roots", "private-key")
 	caPrivKeySecret, err := cu.s.getSecret(ctx, caPrivKeyName)
@@ -774,7 +773,7 @@ func (cu *certUpdateCheck) signWithRoot(ctx context.Context, rootPrivKeySecName 
 	}
 
 	// retrieve root certificate; PEM decode & parse it
-	caCertName := path.Join(cu.s.Prefix, "roots", rootPrivKeySecName, "certificate-latest")
+	caCertName := path.Join(cu.s.Prefix, "roots", "certificate-latest")
 	caCertSecret, err := cu.s.getSecret(ctx, caCertName)
 	if err != nil {
 		return nil, fmt.Errorf("getSecret %q: %w", caCertName, err)
