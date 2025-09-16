@@ -216,8 +216,8 @@ func (s *Server) getACMEClient(ctx context.Context) (*acme.Client, error) {
 var tmpls = template.Must(template.New("root").Parse(`
 <html><h1>scertecd</h1>
 [<a href="/metrics">metrics</a>]
-<table border=1 cellpadding=5>
 <h2>Private CA certs</h2>
+<table border=1 cellpadding=5>
 {{range .PrivateCerts}}
    <tr>
        <td><b>{{.Name}}</b>
@@ -226,7 +226,9 @@ var tmpls = template.Must(template.New("root").Parse(`
 	   </td>
    </tr>
 {{end}}
+</table>
 <h2>Public Let's Encrypt certs</h2>
+<table border=1 cellpadding=5>
 {{range .PublicCerts}}
    <tr>
        <td><b>{{.Name}}</b>
