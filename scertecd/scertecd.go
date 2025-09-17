@@ -999,7 +999,7 @@ func (m *certMeta) RenewalTime() time.Time {
 // and returns metadata about the validity window of the cert(s).
 // If we're over 2/3rds of the way through its validity period, it returns
 // it returns (non-nil, errNeedNewCert).
-func (s *Server) parseCertMeta(p []byte, privateCA bool) (*certMeta, error) {
+func (s *Server) parseCertMeta(p []byte, wantPrivateCA bool) (*certMeta, error) {
 	m := &certMeta{}
 	var blocks []*pem.Block
 	for {
@@ -1012,15 +1012,6 @@ func (s *Server) parseCertMeta(p []byte, privateCA bool) (*certMeta, error) {
 	}
 	if len(blocks) == 0 {
 		return nil, errors.New("no PEM blocks found")
-	}
-	if privateCA {
-		if len(blocks) < 2 {
-			return nil, errors.New("not enough PEM blocks found for private CA cert")
-		}
-	} else {
-		if len(blocks) < 3 {
-			return nil, errors.New("not enough PEM blocks found for LE cert")
-		}
 	}
 	if !strings.HasSuffix(blocks[0].Type, " PRIVATE KEY") {
 		return nil, errors.New("first PEM block is not a private key")
@@ -1051,6 +1042,18 @@ func (s *Server) parseCertMeta(p []byte, privateCA bool) (*certMeta, error) {
 		if m.ValidStart.IsZero() || c.NotBefore.After(m.ValidStart) {
 			m.ValidStart = c.NotBefore
 		}
+	}
+	if m.Leaf == nil {
+		return nil, errors.New("no leaf cert found")
+	}
+
+	isLECert := strings.Contains(m.Leaf.Issuer.Organization[0], "Let's Encrypt")
+	// If the expected issuer changed, generate a new certificate right away.
+	if !wantPrivateCA != isLECert {
+		return m, errNeedNewCert
+	}
+	if isLECert && len(certBlocks) < 2 {
+		return nil, errors.New("expected at least two certs (leaf + issuer) for Let's Encrypt cert")
 	}
 
 	if s.Now().After(m.RenewalTime()) {
